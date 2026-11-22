@@ -225,7 +225,8 @@ private fun Screen() {
                 }
                 SwitchRow("同时本地监听", s.monitor) { v -> c.update { it.copy(monitor = v) } }
                 Text(
-                    "微信、QQ 等应用录音时会自动收到变声后的声音（开头约 0.5 秒为静音）。" +
+                    "微信、QQ 等应用录音时会自动收到变声后的声音，开头约 0.4–0.6 秒为静音（不会漏出本音）；" +
+                        "「采样长度」越小，唤醒越快、但 CPU 负担越大。" +
                         "首次使用会通过 Shizuku 自动开启「RVC 虚拟麦克风」无障碍服务，它只用于让变声采集和语音消息同时进行，不读取屏幕内容。",
                     style = MaterialTheme.typography.bodySmall,
                 )
