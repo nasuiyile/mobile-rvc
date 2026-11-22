@@ -53,12 +53,24 @@ android {
         }
     }
 
+    // Release keystore from the environment (set by CI, see .github/workflows/release.yml).
+    // RVC_KEYSTORE is the .jks path; the passwords and alias come from the other RVC_* vars.
+    val releaseKeystore = providers.environmentVariable("RVC_KEYSTORE").orNull
+    signingConfigs {
+        if (releaseKeystore != null) create("release") {
+            storeFile = file(releaseKeystore)
+            storePassword = providers.environmentVariable("RVC_KEYSTORE_PASSWORD").orNull
+            keyAlias = providers.environmentVariable("RVC_KEY_ALIAS").orNull
+            keyPassword = providers.environmentVariable("RVC_KEY_PASSWORD").orNull
+        }
+    }
+
     buildTypes {
         getByName("release") {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Self-signed builds: debug key unless a keystore is configured
-            signingConfig = signingConfigs.getByName("debug")
+            // Self-signed builds: debug key unless a keystore is configured (RVC_KEYSTORE)
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 

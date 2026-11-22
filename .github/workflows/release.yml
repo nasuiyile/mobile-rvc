@@ -1,0 +1,173 @@
+# Builds both APK variants and publishes them as a GitHub Release.
+#
+#   standard  通用版（CPU / WebGPU / NNAPI / XNNPACK）   com.mobilervc
+#   qnn       骁龙 NPU 版（内置 QNN HTP 运行库）          com.mobilervc.qnn
+#
+# Trigger: push any tag. The tag must equal versionName in android/app/build.gradle.kts,
+# with or without a leading "v" (versionName "0.1.4" -> tag v0.1.4 or 0.1.4).
+# A tag containing "-" (v0.2.0-beta1) is published as a pre-release.
+# Manual runs (Actions -> Release APKs -> Run workflow) only build and upload artifacts.
+#
+# Signing (repository secrets). Without them the APKs are signed with the runner's
+# throwaway debug key, so each release has a different signature and cannot be
+# installed over the previous one.
+#   ANDROID_KEYSTORE_BASE64    base64 of the .jks file
+#   ANDROID_KEYSTORE_PASSWORD
+#   ANDROID_KEY_ALIAS
+#   ANDROID_KEY_PASSWORD
+name: Release APKs
+
+on:
+  push:
+    tags: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build standard + qnn
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.ver.outputs.name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: ver
+        run: |
+          gradle_file=android/app/build.gradle.kts
+          name=$(sed -nE 's/^ *versionName = "([^"]+)".*/\1/p' "$gradle_file" | head -1)
+          code=$(sed -nE 's/^ *versionCode = ([0-9]+).*/\1/p' "$gradle_file" | head -1)
+          echo "versionName=$name versionCode=$code"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$name" ] && [ "$GITHUB_REF_NAME" != "$name" ]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' does not match versionName '$name' in $gradle_file. Bump versionName/versionCode first, then tag v$name."
+            exit 1
+          fi
+
+      # ---- base models (HuBERT / FCPE / synth templates) bundled into the APK ----
+      # Rebuilt only when tools/ changes; otherwise restored from the Actions cache.
+      - name: Restore base model assets
+        id: assets
+        uses: actions/cache/restore@v6
+        with:
+          path: build/apk_assets/rvc
+          key: rvc-assets-${{ hashFiles('tools/**') }}
+
+      - name: Set up Python
+        if: steps.assets.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Build base model assets
+        if: steps.assets.outputs.cache-hit != 'true'
+        working-directory: tools
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch: the export runs on CPU and the CUDA wheels are several GB
+          pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+          PYTHON=python ./build_assets.sh
+
+      - name: Save base model assets
+        if: steps.assets.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: build/apk_assets/rvc
+          key: ${{ steps.assets.outputs.cache-primary-key }}
+
+      # ---- Android toolchain ----
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null || true
+          "$sdkmanager" --install "platforms;android-37.2" "ndk;29.0.14206865" "cmake;3.31.6" > /dev/null
+
+      - name: Decode signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "RVC_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          else
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set: APKs are signed with a throwaway debug key and cannot be installed over a previous release."
+          fi
+
+      - name: Build release APKs
+        working-directory: android
+        env:
+          RVC_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          RVC_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          RVC_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon --stacktrace :app:assembleStandardRelease :app:assembleQnnRelease
+
+      - name: Collect APKs
+        run: |
+          v=${{ steps.ver.outputs.name }}
+          out=android/app/build/outputs/apk
+          mkdir -p dist
+          cp "$out"/standard/release/*.apk "dist/mobile-rvc-$v-standard.apk"
+          cp "$out"/qnn/release/*.apk "dist/mobile-rvc-$v-qnn.apk"
+          (cd dist && sha256sum *.apk > SHA256SUMS.txt)
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mobile-rvc-${{ steps.ver.outputs.name }}
+          path: dist/
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: mobile-rvc-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          cat > notes.md <<EOF
+          | 安装包 | 说明 |
+          |---|---|
+          | \`mobile-rvc-$VERSION-standard.apk\` | 通用版：CPU / GPU（WebGPU）/ NNAPI，所有 arm64 手机 |
+          | \`mobile-rvc-$VERSION-qnn.apk\` | 骁龙 NPU 版：额外内置 QNN HTP 运行库，只对骁龙机型有用 |
+
+          两个版本包名不同（\`com.mobilervc\` / \`com.mobilervc.qnn\`），可以同时安装。校验值见 \`SHA256SUMS.txt\`。
+          EOF
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            pre=()
+            case "$TAG" in *-*) pre=(--prerelease) ;; esac
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "$TAG" --notes-file notes.md --generate-notes "${pre[@]}"
+          fi
