@@ -91,6 +91,7 @@ class ShellAudioService() : IShellAudio.Stub() {
     @Volatile private var a11yOk = false
     @Volatile private var shellSilenced: Boolean? = null
     @Volatile private var appSilenced: Boolean? = null
+    @Volatile private var victimSilenced = false  // the system mutes the recording we feed
     @Volatile private var captured = 0L
     @Volatile private var injected = 0L
     @Volatile private var dropped = 0L
@@ -194,16 +195,21 @@ class ShellAudioService() : IShellAudio.Stub() {
                 var shellCfg: AudioRecordingConfiguration? = null
                 var appCfg: AudioRecordingConfiguration? = null
                 val victims = mutableListOf<Pair<Int, Int>>()
+                var muted = false
                 for (c in am.activeRecordingConfigurations) {
                     val uid = clientUid(c)
                     when {
                         uid == myUid -> shellCfg = c
                         uid == appUid -> appCfg = c
-                        c.clientAudioSource in intercept -> victims += uid to c.clientAudioSource
+                        c.clientAudioSource in intercept -> {
+                            victims += uid to c.clientAudioSource
+                            if (c.isClientSilenced) muted = true
+                        }
                     }
                 }
                 shellSilenced = shellCfg?.isClientSilenced
                 appSilenced = appCfg?.isClientSilenced
+                victimSilenced = muted
                 victimsJson = JSONArray(victims.map { JSONObject().put("uid", it.first).put("source", it.second) })
                 if (victims.isEmpty()) {
                     victimKey = ""
@@ -349,12 +355,26 @@ class ShellAudioService() : IShellAudio.Stub() {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
                 val frames = sr / 100
                 val buf = ByteBuffer.allocateDirect(frames * 4).order(ByteOrder.nativeOrder())
+                var rec = r
                 while (capturing && running) {
                     buf.clear()
-                    val n = r.read(buf, frames * 4, AudioRecord.READ_BLOCKING)
+                    val n = rec.read(buf, frames * 4, AudioRecord.READ_BLOCKING)
                     if (n <= 0) {
-                        if (n < 0) lastError = "AudioRecord.read=$n"
                         if (!capturing) break
+                        if (n < 0) {
+                            // dead (audio server restart): this recorder has to be built again
+                            Log.w(TAG, "AudioRecord.read=$n, rebuilding the recorder")
+                            runCatching { rec.release() }
+                            record = null
+                            Thread.sleep(100)
+                            val nr = prepareRecord()
+                            if (nr == null) {
+                                lastError = "AudioRecord.read=$n"
+                                continue
+                            }
+                            runCatching { nr.startRecording() }
+                            rec = nr
+                        }
                         continue
                     }
                     buf.limit(n)
@@ -473,27 +493,49 @@ class ShellAudioService() : IShellAudio.Stub() {
         injectThread = Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             val frames = sr / 100
-            // Read in small pieces (20 ms): the app sizes its output delay from how much is
-            // still unread in this pipe, so audio must not sit here in a large private buffer.
-            val buf = ByteBuffer.allocateDirect(frames * 4 * 2).order(ByteOrder.nativeOrder())
-            val pcm = ShortArray(frames * 2)
+            val buf = ByteBuffer.allocateDirect(frames * 4 * 8).order(ByteOrder.nativeOrder())
+            val pcm = ShortArray(frames * 8)
             val fis = java.io.FileInputStream(input)
             val silence = ShortArray(sr / 200)  // 5 ms
             val noise = if (comfortNoiseDb < 0) ComfortNoise(comfortNoiseDb) else null
-            var written = 0L  // frames written to the track (silence + audio)
+            var written = 0L  // frames the track took (silence + audio), comparable to its head position
             val pfd = arrayOf(android.system.StructPollfd().apply { fd = input; events = OsConstants.POLLIN.toShort() })
-            // A streaming AudioTrack only starts running once its buffer has been filled for the
-            // first time. The 5 ms top-ups below never get there: they stop as soon as 10 ms are
-            // queued, and nothing is consumed before the track runs. Left like that, the track
-            // would stay idle until the first converted block arrived, the injection input would
-            // count as unavailable, and the first recording after starting would be routed to the
-            // real microphone for its first half second.
-            runCatching {
-                val prime = ShortArray(maxOf(t.bufferSizeInFrames, sr * 3 / 20))
-                noise?.fill(prime)
-                t.write(prime, 0, prime.size, AudioTrack.WRITE_BLOCKING)
-                written = prime.size.toLong()
+
+            fun head() = t.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+
+            // Hands samples to the track. False when it did not take them: while the audio server
+            // is restarting the track is dead until the framework has restored it.
+            fun put(a: ShortArray, n: Int): Boolean {
+                var off = 0
+                while (off < n && alive()) {
+                    val w = t.write(a, off, n - off, AudioTrack.WRITE_BLOCKING)
+                    if (w <= 0) {
+                        Thread.sleep(20)
+                        return false
+                    }
+                    off += w
+                    written += w
+                }
+                return off == n
             }
+
+            // A streaming AudioTrack only starts running once its buffer has been filled for the
+            // first time, and the same holds again after a flush and after the framework
+            // re-created it (audio server restart, some route changes). The 5 ms top-ups below
+            // never get there: they stop as soon as 10 ms are queued, and nothing is consumed
+            // before the track runs. Left like that, the track would stay idle until the next
+            // converted block arrived, the injection input would count as unavailable, and that
+            // recording would be routed to the real microphone for its first half second.
+            fun prime() {
+                val a = ShortArray(maxOf(t.bufferSizeInFrames, sr * 3 / 20))
+                noise?.fill(a)  // also what the next recording reads first
+                written = head()
+                put(a, a.size)
+            }
+
+            runCatching { prime() }
+            var lastHead = head()
+            var headMovedAt = SystemClock.uptimeMillis()
             while (alive()) {
                 try {
                     // keep latency bounded if we fall behind
@@ -504,38 +546,44 @@ class ShellAudioService() : IShellAudio.Stub() {
                         while (left > 0) left -= fis.skip(left)
                         dropped += skip / 4
                     }
-                    // No converted audio yet (standby, or the first block of a new recording is
-                    // still being computed): keep the injection track fed with silence. A starved
-                    // track is made inactive by AudioFlinger, the policy then marks the remote
-                    // submix input unavailable and a newly started recording is routed to the real
-                    // microphone - the other side would hear the unprocessed voice for ~1 s.
                     if (flushPlayback) {
                         flushPlayback = false
                         var left = fis.available().toLong()
                         while (left > 0) left -= fis.skip(left)
                     }
                     if (resetTrack) {
-                        // recording ended: drop the unplayed tail and push ~150 ms of silence through,
+                        // recording ended: drop the unplayed tail and push a buffer of silence through,
                         // which also replaces the remote submix pipe content (with no reader attached
                         // it keeps the newest frames) - the next recording must not start with it
                         resetTrack = false
                         runCatching { t.pause(); t.flush(); t.play() }
-                        written = (t.playbackHeadPosition.toLong() and 0xFFFFFFFFL)
-                        // at least a full buffer, or the track would not start running again
-                        val flushSilence = ShortArray(maxOf(t.bufferSizeInFrames, sr * 3 / 20))
-                        noise?.fill(flushSilence)  // what the next recording reads first
-                        t.write(flushSilence, 0, flushSilence.size, AudioTrack.WRITE_BLOCKING)
-                        written += flushSilence.size
+                        prime()
                     }
                     pfd[0].revents = 0
                     if (Os.poll(pfd, 2) == 0) {
-                        // only top up when almost drained, so real audio never queues behind silence
+                        // No converted audio (standby, or the first block of a new recording is
+                        // still being computed): keep the injection track fed. A starved track is
+                        // made inactive by AudioFlinger, the policy then marks the remote submix
+                        // input unavailable and a newly started recording is routed to the real
+                        // microphone - the other side would hear the unprocessed voice for ~1 s.
+                        // Only top up when almost drained, so real audio never queues behind it.
                         // 32-bit modular difference (the head position wraps after ~24 h at 48 kHz)
-                        val queued = ((written and 0xFFFFFFFFL) - (t.playbackHeadPosition.toLong() and 0xFFFFFFFFL)) and 0xFFFFFFFFL
+                        val h = head()
+                        val now = SystemClock.uptimeMillis()
+                        if (h != lastHead) {
+                            lastHead = h
+                            headMovedAt = now
+                        }
+                        val queued = ((written and 0xFFFFFFFFL) - h) and 0xFFFFFFFFL
                         if (queued < sr / 100) {
                             noise?.fill(silence)
-                            t.write(silence, 0, silence.size, AudioTrack.WRITE_BLOCKING)
-                            written += silence.size
+                            put(silence, silence.size)
+                        } else if (now - headMovedAt > 200) {
+                            // frames are queued but none is being played: the track is waiting for a
+                            // full buffer again (see prime), e.g. after the audio server restarted
+                            Log.i(TAG, "injection track stalled, restarting it")
+                            prime()
+                            headMovedAt = SystemClock.uptimeMillis()
                         }
                         continue
                     }
@@ -557,9 +605,8 @@ class ShellAudioService() : IShellAudio.Stub() {
                     } else {
                         for (i in 0 until samples) pcm[i] = (fb.get(i).coerceIn(-1f, 1f) * 32767f).roundToInt().toShort()
                     }
-                    t.write(pcm, 0, samples, AudioTrack.WRITE_BLOCKING)
-                    written += samples
-                    injected += samples
+                    if (put(pcm, samples)) injected += samples
+                    headMovedAt = SystemClock.uptimeMillis()
                 } catch (e: ErrnoException) {
                     if (e.errno != OsConstants.EINTR) {
                         // stop() closes the pipe under us: that is the end of the session, not a fault
@@ -569,6 +616,15 @@ class ShellAudioService() : IShellAudio.Stub() {
                 } catch (e: java.io.IOException) {
                     if (alive()) lastError = "playback pipe: ${e.message}"
                     break
+                } catch (e: InterruptedException) {
+                    break
+                } catch (e: Throwable) {
+                    // anything unexpected from the track (e.g. while the audio server restarts):
+                    // without this thread nothing is injected any more, so keep going
+                    if (!alive()) break
+                    lastError = "inject: $e"
+                    Log.w(TAG, "inject", e)
+                    runCatching { Thread.sleep(50) }
                 }
             }
         }, "rvc-inject").apply { start() }
@@ -614,6 +670,7 @@ class ShellAudioService() : IShellAudio.Stub() {
         .put("a11y", a11yOk)
         .put("shell_silenced", shellSilenced ?: JSONObject.NULL)
         .put("app_silenced", appSilenced ?: JSONObject.NULL)
+        .put("victim_silenced", victimSilenced)
         .put("captured", captured)
         .put("injected", injected)
         .put("dropped", dropped)

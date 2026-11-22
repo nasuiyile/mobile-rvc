@@ -13,7 +13,6 @@
 namespace rvc {
 
 class MappedFile;
-class ThreadPool;
 
 // Parse a faiss IndexIVFFlat file and write it as index.bin. Returns the vector count.
 int64_t convert_faiss_index(const std::string& faiss_path, const std::string& out_path, int* dim_out = nullptr);
@@ -26,8 +25,7 @@ class IvfIndex {
   int64_t size() const { return ntotal_; }
   int nprobe() const { return nprobe_; }
   // For each of n query rows (dim floats each) compute the k-NN blend into out (n x dim).
-  // Rows are independent; with a pool they are searched in parallel (same result).
-  void search_blend(const float* q, int n, float* out, int k = 8, int nprobe = 0, ThreadPool* pool = nullptr) const;
+  void search_blend(const float* q, int n, float* out, int k = 8, int nprobe = 0) const;
 
  private:
   std::unique_ptr<MappedFile> file_;
@@ -39,7 +37,6 @@ class IvfIndex {
   const uint16_t* vec16_ = nullptr;
   const float* vec32_ = nullptr;
   std::vector<float> cnorm_;
-  void search_row(const float* x, float* o, int k, int nprobe) const;
 };
 
 }  // namespace rvc

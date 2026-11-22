@@ -11,7 +11,6 @@
 #if defined(__ANDROID__) || defined(__linux__)
 #include <sched.h>
 #include <sys/resource.h>
-#include <unistd.h>
 #endif
 
 namespace rvc {
@@ -32,12 +31,6 @@ class ThreadPool {
     for (auto& t : workers_) t.join();
   }
   int size() const { return static_cast<int>(workers_.size()) + 1; }
-  // Kernel thread ids of the pool's own threads (the caller is not included).
-  std::vector<int> tids() {
-    std::unique_lock<std::mutex> lk(mu_);
-    cv_.wait(lk, [&] { return tids_.size() == workers_.size(); });
-    return tids_;
-  }
 
   // Runs fn(i) for i in [0, n); returns when all are done.
   void parallel_for(int n, const std::function<void(int)>& fn) {
@@ -71,7 +64,6 @@ class ThreadPool {
  private:
   std::vector<std::thread> workers_;
   std::vector<int> affinity_;
-  std::vector<int> tids_;
   std::mutex mu_;
   std::condition_variable cv_, done_cv_;
   const std::function<void(int)>* fn_ = nullptr;
@@ -99,15 +91,6 @@ class ThreadPool {
     setpriority(PRIO_PROCESS, 0, -16);  // compute helpers of the realtime audio worker
 #endif
     (void)idx;
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-#if defined(__ANDROID__) || defined(__linux__)
-      tids_.push_back(static_cast<int>(gettid()));
-#else
-      tids_.push_back(0);
-#endif
-    }
-    cv_.notify_all();
     uint64_t seen = 0;
     for (;;) {
       {

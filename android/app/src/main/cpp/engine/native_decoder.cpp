@@ -201,8 +201,6 @@ NativeDecoder::NativeDecoder(const std::string& model_dir, const std::vector<flo
 
 NativeDecoder::~NativeDecoder() = default;
 
-std::vector<int> NativeDecoder::tids() const { return pool_->tids(); }
-
 void NativeDecoder::pack(Conv& c, const std::vector<float>& w, int Co, int Ci, int K, const std::vector<int>& kidx,
                          const std::vector<int>& off, const float* bias) {
   c.Co = Co;

@@ -3,14 +3,13 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <sched.h>
-#include <sys/ioctl.h>
 #include <sys/resource.h>
-#include <time.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 
@@ -102,13 +101,6 @@ DriverOptions DriverOptions::from_json(const Json& j) {
   o.debug_input = j.str_or("debug_input", "");
   o.virtual_capture = j.bool_or("virtual_capture", o.virtual_capture);
   o.warmup = j.bool_or("warmup", o.warmup);
-  o.pipeline = static_cast<int>(j.num_or("pipeline", o.pipeline));
-  if (j.bool_or("pipeline", false)) o.pipeline = 1;        // also accepts true / false
-  else if (!j.bool_or("pipeline", true)) o.pipeline = 0;
-  o.playout_control = j.bool_or("playout_control", o.playout_control);
-  o.sim_output = j.bool_or("sim_output", o.sim_output);
-  o.sim_record = j.str_or("sim_record", "");
-  o.debug_stall = j.str_or("debug_stall", "");
   return o;
 }
 
@@ -130,6 +122,7 @@ const float* RealtimeDriver::input_samples(const float* captured, size_t n) {
 
 aaudio_data_callback_result_t RealtimeDriver::in_cb(AAudioStream*, void* user, void* audio, int32_t frames) {
   auto* d = static_cast<RealtimeDriver*>(user);
+  d->in_cb_frames_.fetch_add(frames, std::memory_order_relaxed);
   int m = d->capture_mode_.load(std::memory_order_relaxed);
   if (m == 0 || m == 2) return AAUDIO_CALLBACK_RESULT_CONTINUE;  // virtual mic idle / shell captures
   const float* src = d->input_samples(static_cast<const float*>(audio), static_cast<size_t>(frames));
@@ -140,6 +133,7 @@ aaudio_data_callback_result_t RealtimeDriver::in_cb(AAudioStream*, void* user, v
 
 aaudio_data_callback_result_t RealtimeDriver::out_cb(AAudioStream*, void* user, void* audio, int32_t frames) {
   auto* d = static_cast<RealtimeDriver*>(user);
+  d->out_cb_calls_.fetch_add(1, std::memory_order_relaxed);
   float* out = static_cast<float*>(audio);
   // bound latency: never keep more than max_queue_blocks blocks queued
   size_t cap = static_cast<size_t>(d->block_) * std::max(1, d->opt_.max_queue_blocks);
@@ -150,14 +144,10 @@ aaudio_data_callback_result_t RealtimeDriver::out_cb(AAudioStream*, void* user, 
     d->dropped_.fetch_add(static_cast<int64_t>(drop), std::memory_order_relaxed);
   }
   size_t r = d->out_ring_.read(out, static_cast<size_t>(frames));
-  const bool dry = r < static_cast<size_t>(frames);
-  if (dry) {
+  if (r < static_cast<size_t>(frames)) {
     std::fill(out + r, out + frames, 0.f);
-    // one count per dropout (the moment the queue runs dry), not per silent callback
-    if (!d->out_dry_.load(std::memory_order_relaxed) && d->blocks_.load(std::memory_order_relaxed) > 1)
-      d->out_underruns_.fetch_add(1, std::memory_order_relaxed);
+    if (d->blocks_.load(std::memory_order_relaxed) > 1) d->out_underruns_.fetch_add(1, std::memory_order_relaxed);
   }
-  d->out_dry_.store(dry, std::memory_order_relaxed);
   return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -203,16 +193,145 @@ bool RealtimeDriver::input_should_run() const {
   return m == 1 || (m < 0 && opt_.local_input);
 }
 
+static int debug_prop(const char* name) {
+  char v[PROP_VALUE_MAX] = {0};
+  return __system_property_get(name, v) > 0 ? atoi(v) : 0;
+}
+
+static int64_t steady_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+}
+
+// Starts the capture stream. A stream that was disconnected while it was stopped (an audio
+// route change while idle: nobody tells a stopped stream) does not start any more; it is then
+// replaced by a new one. Returns false, with the error set, when no stream could be started.
+bool RealtimeDriver::start_input_locked() {
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (!in_) {
+      try {
+        in_ = open_stream(true);
+      } catch (const std::exception& e) {
+        set_error(e.what());
+        RVC_LOGE("%s", e.what());
+        return false;
+      }
+    }
+    aaudio_result_t r;
+    if (dbg_fail_start_ > 0) {
+      --dbg_fail_start_;
+      r = AAUDIO_ERROR_DISCONNECTED;
+    } else if (dbg_mute_start_ > 0) {
+      --dbg_mute_start_;
+      r = AAUDIO_OK;  // pretend: the stream stays stopped and delivers nothing
+    } else {
+      r = AAudioStream_requestStart(in_);
+    }
+    if (r == AAUDIO_OK) return true;
+    RVC_LOGW("capture stream did not start (%s): replacing it", AAudio_convertResultToText(r));
+    AAudioStream_close(in_);
+    in_ = nullptr;
+    input_reopens_.fetch_add(1);
+  }
+  set_error("microphone stream cannot be started");
+  return false;
+}
+
+bool RealtimeDriver::start_output_locked() {
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    if (!out_) {
+      try {
+        out_ = open_stream(false);
+      } catch (const std::exception& e) {
+        set_error(e.what());
+        RVC_LOGE("%s", e.what());
+        return false;
+      }
+    }
+    aaudio_result_t r = AAudioStream_requestStart(out_);
+    if (r == AAUDIO_OK) return true;
+    RVC_LOGW("playback stream did not start (%s): replacing it", AAudio_convertResultToText(r));
+    AAudioStream_close(out_);
+    out_ = nullptr;
+    output_reopens_.fetch_add(1);
+  }
+  set_error("playback stream cannot be started");
+  return false;
+}
+
+// Opens whatever is missing. The two streams are independent: a failure of one must not keep
+// the other from coming (back) up.
 void RealtimeDriver::open_streams() {
   std::lock_guard<std::mutex> lk(stream_mu_);
-  if (opt_.local_output && !opt_.sim_output && !out_) {
-    out_ = open_stream(false);
-    AAudioStream_requestStart(out_);
-  }
+  bool ok = true;
+  if (opt_.local_output && !out_) ok = start_output_locked() && ok;
   // virtual-mic mode keeps the input opened but stopped, so waking up only needs a start
   if ((opt_.local_input || opt_.virtual_capture) && !in_) {
-    in_ = open_stream(true);
-    if (input_should_run()) AAudioStream_requestStart(in_);
+    if (input_should_run()) {
+      ok = start_input_locked() && ok;
+    } else {
+      try {
+        in_ = open_stream(true);
+      } catch (const std::exception& e) {
+        set_error(e.what());
+        ok = false;
+      }
+    }
+  }
+  if (!ok) {
+    std::lock_guard<std::mutex> el(err_mu_);
+    throw Error(last_error_.empty() ? "audio stream error" : last_error_);
+  }
+}
+
+// Streams can die without telling anyone: replace those that should be delivering but are
+// not. Called from the worker every 50 ms.
+void RealtimeDriver::watch_streams() {
+  const auto now = Clock::now();
+  auto since = [&](Clock::time_point t) { return std::chrono::duration<double, std::milli>(now - t).count(); };
+  // capture: the callback must keep coming while the stream is supposed to run
+  const int64_t nin = in_cb_frames_.load(std::memory_order_relaxed);
+  if (!input_should_run() || nin != wd_in_frames_) {
+    wd_in_frames_ = nin;
+    wd_in_time_ = now;
+    wd_in_tries_ = 0;
+  } else if (since(wd_in_time_) > (wd_in_tries_ == 0 ? 500.0 : 1500.0)) {
+    RVC_LOGW("no microphone data for %.0f ms: replacing the capture stream (attempt %d)", since(wd_in_time_), wd_in_tries_ + 1);
+    {
+      std::lock_guard<std::mutex> lk(stream_mu_);
+      if (in_) {
+        AAudioStream_requestStop(in_);
+        AAudioStream_close(in_);
+        in_ = nullptr;
+      }
+      if (input_should_run() && start_input_locked()) set_error("");
+    }
+    input_reopens_.fetch_add(1);
+    wd_in_time_ = Clock::now();
+    ++wd_in_tries_;
+  }
+  // playback (monitor): its callback runs all the time, data or not
+  if (opt_.local_output) {
+    const int64_t nout = out_cb_calls_.load(std::memory_order_relaxed);
+    if (nout != wd_out_calls_) {
+      wd_out_calls_ = nout;
+      wd_out_time_ = now;
+      wd_out_tries_ = 0;
+    } else if (since(wd_out_time_) > (wd_out_tries_ == 0 ? 1000.0 : 3000.0)) {
+      RVC_LOGW("playback stream idle for %.0f ms: replacing it (attempt %d)", since(wd_out_time_), wd_out_tries_ + 1);
+      {
+        std::lock_guard<std::mutex> lk(stream_mu_);
+        if (out_) {
+          AAudioStream_requestStop(out_);
+          AAudioStream_close(out_);
+          out_ = nullptr;
+        }
+        out_ring_.skip(out_ring_.available());  // no callback is running now: stale audio goes
+        start_output_locked();
+      }
+      output_reopens_.fetch_add(1);
+      wd_out_time_ = Clock::now();
+      ++wd_out_tries_;
+    }
   }
 }
 
@@ -233,28 +352,11 @@ void RealtimeDriver::set_capture_mode(int m) {
   std::lock_guard<std::mutex> lk(stream_mu_);
   int prev = capture_mode_.exchange(m);
   if (!running_.load() || prev == m) return;
-  if (in_) {
-    if (m == 1) AAudioStream_requestStart(in_);
-    else AAudioStream_requestStop(in_);
-  } else if (m == 1) {
-    try {
-      in_ = open_stream(true);
-      AAudioStream_requestStart(in_);
-    } catch (const std::exception& e) {
-      set_error(e.what());
-    }
-  }
+  if (m == 1) start_input_locked();  // also replaces a stream that died while it was idle
+  else if (in_) AAudioStream_requestStop(in_);
   if (m != 0 && prev == 0) wake_pending_ = true;  // fresh recording: start from a clean state
   if (m == 0) idle_pending_ = true;
   cv_.notify_one();
-}
-
-// The conversion threads compute on the big cores (as the engine's own pools do).
-static void pin_to_big_cores() {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  for (int c : big_cores()) CPU_SET(c, &set);
-  sched_setaffinity(0, sizeof(set), &set);
 }
 
 void RealtimeDriver::start(const DriverOptions& opt) {
@@ -269,9 +371,7 @@ void RealtimeDriver::start(const DriverOptions& opt) {
   in_ring_.reset(static_cast<size_t>(block_) * 8 + 8192);
   out_ring_.reset(static_cast<size_t>(block_) * 8 + 8192);
   in_overflows_ = out_underruns_ = dropped_ = blocks_ = late_blocks_ = 0;
-  out_dry_ = true;
   last_ms_ = avg_ms_ = max_ms_ = 0;
-  avg_acc_ = 0;
   set_error("");
   debug_wav_.clear();
   scratch_.assign(16384, 0.f);
@@ -285,30 +385,19 @@ void RealtimeDriver::start(const DriverOptions& opt) {
       RVC_LOGE("debug input: %s", e.what());
     }
   }
-  stalls_.clear();
-  for (size_t p = 0; p < opt_.debug_stall.size();) {
-    size_t e = opt_.debug_stall.find(',', p);
-    if (e == std::string::npos) e = opt_.debug_stall.size();
-    std::string item = opt_.debug_stall.substr(p, e - p);
-    size_t c = item.find(':');
-    if (c != std::string::npos) stalls_.emplace_back(atoll(item.substr(0, c).c_str()), atoi(item.substr(c + 1).c_str()));
-    p = e + 1;
-  }
-  sim_played_.clear();
-  play_local_.configure(sr_, block_, true);
-  play_pipe_.configure(sr_, block_, false);
-  pipelined_ = !opt_.passthrough && (opt_.pipeline > 0 || (opt_.pipeline < 0 && engine_->stages_independent()));
-  slot_full_ = synth_busy_ = false;
-  pipe_level_ok_ = true;
-  in_device_ms_ = out_device_ms_ = -1;
-  worker_tid_ = synth_tid_ = 0;
   engine_->reset_state();
-  // The first runs of a session are much slower than the rest (GPU pipelines are compiled, the
-  // NPU and the CPU clocks ramp up, buffers are allocated). Get them out of the way before
-  // audio flows: a slow first block would otherwise sit in the output queue as extra delay.
-  if (opt_.warmup && !opt_.passthrough) warm_up(2);
   capture_mode_ = opt_.virtual_capture ? 0 : -1;
   wake_pending_ = idle_pending_ = false;
+  in_cb_frames_ = out_cb_calls_ = input_reopens_ = output_reopens_ = 0;
+  wd_in_frames_ = wd_out_calls_ = 0;
+  wd_in_tries_ = wd_out_tries_ = 0;
+  wd_checked_ = wd_in_time_ = wd_out_time_ = Clock::now();
+  in_peak_ = 0.f;
+  in_zero_ms_ = 0;
+  last_block_ms_ = steady_ms();
+  first_block_pending_ = true;
+  dbg_fail_start_ = debug_prop("debug.rvc.fail_start");
+  dbg_mute_start_ = debug_prop("debug.rvc.mute_start");
   if (opt_.playback_fd >= 0) fcntl(opt_.playback_fd, F_SETFL, fcntl(opt_.playback_fd, F_GETFL) | O_NONBLOCK);
   try {
     open_streams();
@@ -316,35 +405,16 @@ void RealtimeDriver::start(const DriverOptions& opt) {
     stop();
     throw;
   }
-  if (opt_.sim_output) out_burst_ = sr_ / 250;
-  play_local_.configure(sr_, block_, true, out_burst_);
   running_ = true;
-  if (pipelined_) synth_ = std::thread([this] { synth_loop(); });
   worker_ = std::thread([this] { worker_loop(); });
   if (opt_.capture_fd >= 0) reader_ = std::thread([this] { reader_loop(); });
-  if (opt_.sim_output && opt_.local_output) sim_ = std::thread([this] { sim_loop(); });
-  RVC_LOGI("driver started: block %d, %s", block_, pipelined_ ? "two-stage pipeline" : "single stage");
 }
 
 void RealtimeDriver::stop() {
   if (running_.exchange(false)) {
     cv_.notify_all();
-    {
-      std::lock_guard<std::mutex> lk(hand_mu_);
-    }
-    hand_cv_.notify_all();
     if (worker_.joinable()) worker_.join();
-    if (synth_.joinable()) synth_.join();
     if (reader_.joinable()) reader_.join();
-    if (sim_.joinable()) sim_.join();
-    hint_close();
-    if (!opt_.sim_record.empty() && !sim_played_.empty()) {
-      try {
-        write_wav_f32(opt_.sim_record, sim_played_, sr_);
-      } catch (const std::exception& e) {
-        RVC_LOGE("sim record: %s", e.what());
-      }
-    }
   }
   close_streams();
   for (int* fd : {&opt_.capture_fd, &opt_.playback_fd}) {
@@ -380,158 +450,20 @@ void RealtimeDriver::reader_loop() {
   }
 }
 
-// Test hook: plays the local output like an audio device would (4 ms bursts on a steady clock).
-void RealtimeDriver::sim_loop() {
-  setpriority(PRIO_PROCESS, 0, -19);
-  const int frames = sr_ / 250;
-  std::vector<float> buf(static_cast<size_t>(frames));
-  const auto t0 = Clock::now();
-  for (int64_t k = 1; running_.load(); ++k) {
-    out_cb(nullptr, this, buf.data(), frames);
-    if (!opt_.sim_record.empty()) sim_played_.insert(sim_played_.end(), buf.begin(), buf.end());
-    std::this_thread::sleep_until(t0 + std::chrono::microseconds(k * 4000));
-  }
-}
-
-// ------------------------------------------------------------------ ADPF session
-void RealtimeDriver::hint_open() {
-  Adpf& a = adpf();
-  if (!a.ok) return;
-  void* mgr = a.get_manager();
-  if (!mgr) return;
-  // every thread that computes part of a block: both stages and the engine's helpers
-  std::vector<int32_t> tids;
-  for (int t : {worker_tid_.load(), synth_tid_.load()})
-    if (t > 0) tids.push_back(t);
-  size_t own = tids.size();
-  for (int t : engine_->helper_tids()) tids.push_back(t);
-  // Latency is block + inference time, so every millisecond of inference counts: ask for much
-  // less than the deadline instead of "just in time".
-  const int64_t target = static_cast<int64_t>(1e9 * block_ / sr_) / 4;
-  std::lock_guard<std::mutex> lk(hint_mu_);
-  hint_ = a.create(mgr, tids.data(), tids.size(), target);
-  if (!hint_ && own > 0) hint_ = a.create(mgr, tids.data(), own, target);
-}
-
-void RealtimeDriver::hint_report(double ms) {
-  std::lock_guard<std::mutex> lk(hint_mu_);
-  if (hint_) adpf().report(hint_, static_cast<int64_t>(ms * 1e6));
-}
-
-void RealtimeDriver::hint_boost(const char* why) {
-  std::lock_guard<std::mutex> lk(hint_mu_);
-  if (hint_ && adpf().workload_increase) adpf().workload_increase(hint_, true, false, why);
-}
-
-void RealtimeDriver::hint_close() {
-  std::lock_guard<std::mutex> lk(hint_mu_);
-  if (hint_) adpf().close(hint_);
-  hint_ = nullptr;
-}
-
-// ------------------------------------------------------------------ conversion
-void RealtimeDriver::warm_up(int blocks) {
-  std::vector<float> in(static_cast<size_t>(block_), 0.f), out(static_cast<size_t>(block_));
-  try {
-    for (int i = 0; i < blocks; ++i) {
-      auto t = Clock::now();
-      engine_->process_block(in.data(), out.data());
-      RVC_LOGI("warm-up block %.0f ms", ms_since(t));
-    }
-  } catch (const std::exception& e) {
-    RVC_LOGW("warm-up: %s", e.what());
-  }
-  engine_->reset_state();
-}
-
-// How long a frame spends between the stream's buffer and the transducer, from the streams' own
-// timestamps. Only used for the delay shown to the user.
-void RealtimeDriver::measure_device_latency() {
-  std::unique_lock<std::mutex> lk(stream_mu_, std::try_to_lock);
-  if (!lk.owns_lock()) return;
-  timespec ts{};
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  const int64_t now = static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
-  int64_t pos = 0, t = 0;
-  if (out_ && AAudioStream_getTimestamp(out_, CLOCK_MONOTONIC, &pos, &t) == AAUDIO_OK) {
-    // the frame written last is presented (written - pos) frames after the one presented at t
-    double ms = 1000.0 * (AAudioStream_getFramesWritten(out_) - pos) / sr_ - (now - t) / 1e6;
-    if (ms >= 0 && ms < 2000) out_device_ms_ = ms;
-  }
-  if (in_ && input_should_run() && AAudioStream_getTimestamp(in_, CLOCK_MONOTONIC, &pos, &t) == AAUDIO_OK) {
-    // frames captured by now, minus the ones already handed to us
-    double ms = 1000.0 * (pos - AAudioStream_getFramesRead(in_)) / sr_ + (now - t) / 1e6;
-    if (ms >= 0 && ms < 2000) in_device_ms_ = ms;
-  }
-}
-
-void RealtimeDriver::settle() {
-  if (!pipelined_) return;
-  std::unique_lock<std::mutex> lk(hand_mu_);
-  hand_cv_.wait(lk, [&] { return (!slot_full_ && !synth_busy_) || !running_.load(); });
-}
-
-// Queues one converted block for every consumer. t_in: when its last input sample arrived;
-// t_read: when the converter started on it.
-void RealtimeDriver::emit(float* out, Clock::time_point t_in, Clock::time_point t_read) {
-  const size_t n = static_cast<size_t>(block_);
-  if (opt_.output_gain != 1.f)
-    for (size_t i = 0; i < n; ++i) out[i] *= opt_.output_gain;
-  if (opt_.local_output) {
-    shaped_.assign(out, out + n);
-    if (opt_.playout_control) play_local_.shape(shaped_, out_ring_.available(), ms_since(t_in), ms_since(t_read));
-    out_ring_.write(shaped_.data(), shaped_.size());
-  }
-  if (opt_.playback_fd >= 0) {
-    shaped_.assign(out, out + n);
-    if (opt_.playout_control && pipe_level_ok_) {
-      int pending = 0;  // bytes the injection service has not read yet
-      if (ioctl(opt_.playback_fd, FIONREAD, &pending) == 0) {
-        play_pipe_.shape(shaped_, static_cast<size_t>(std::max(pending, 0)) / sizeof(float), ms_since(t_in), ms_since(t_read));
-      } else {
-        pipe_level_ok_ = false;  // not permitted here: deliver as is, the service bounds the backlog
-        RVC_LOGW("FIONREAD on the playback pipe failed (%s): output delay control off for the pipe", strerror(errno));
-      }
-    }
-    const char* p = reinterpret_cast<const char*>(shaped_.data());
-    size_t left = shaped_.size() * sizeof(float);
-    while (left > 0) {
-      ssize_t w = write(opt_.playback_fd, p, left);
-      if (w < 0) {
-        if (errno == EAGAIN) dropped_.fetch_add(static_cast<int64_t>(left / sizeof(float)));
-        else if (errno != EINTR) set_error("playback stream closed");
-        if (errno != EINTR) break;
-        continue;
-      }
-      p += w;
-      left -= static_cast<size_t>(w);
-    }
-  }
-}
-
-// ms: input complete -> output queued. A block is late when a stage cannot keep up with realtime.
-void RealtimeDriver::finish_block(double ms, double stage_a_ms, double stage_b_ms) {
-  hint_report(ms);
-  const double block_ms = 1000.0 * block_ / sr_;
-  int64_t n = blocks_.fetch_add(1) + 1;
-  avg_acc_ = n == 1 ? ms : avg_acc_ * 0.9 + ms * 0.1;
-  last_ms_ = ms;
-  avg_ms_ = avg_acc_;
-  if (n > 2) max_ms_ = std::max(max_ms_.load(), ms);
-  if ((pipelined_ ? std::max(stage_a_ms, stage_b_ms) : ms) > block_ms) late_blocks_.fetch_add(1);
-}
-
 void RealtimeDriver::worker_loop() {
   setpriority(PRIO_PROCESS, 0, -19);
-  pin_to_big_cores();
-  worker_tid_ = gettid();
-  if (!pipelined_) hint_open();
+  Adpf& hint = adpf();
+  void* session = nullptr;
+  const int64_t block_ns = static_cast<int64_t>(1e9 * block_ / sr_);
+  if (hint.ok) {
+    void* mgr = hint.get_manager();
+    int32_t tid = gettid();
+    if (mgr) session = hint.create(mgr, &tid, 1, block_ns * 8 / 10);
+  }
   std::vector<float> in(block_), out(block_);
-  Job job;
-  int64_t seq = 0;  // blocks read since the stream / the recording started
+  double avg = 0;
   while (running_.load()) {
     if (restart_.exchange(false)) {
-      settle();
       close_streams();
       try {
         open_streams();
@@ -539,7 +471,10 @@ void RealtimeDriver::worker_loop() {
         set_error(e.what());
         RVC_LOGE("reopen failed: %s", e.what());
       }
-      play_local_.configure(sr_, block_, true, out_burst_);  // the new stream may use another burst size
+    }
+    if (std::chrono::duration<double, std::milli>(Clock::now() - wd_checked_).count() > 50.0) {
+      wd_checked_ = Clock::now();
+      watch_streams();
     }
     if (idle_pending_.exchange(false)) in_ring_.skip(in_ring_.available());
     if (wake_pending_.exchange(false)) {
@@ -547,13 +482,21 @@ void RealtimeDriver::worker_loop() {
       // while the first real block is still being captured, run one silent block so caches,
       // thread pools and CPU clocks are warm when it arrives.
       in_ring_.skip(in_ring_.available());
-      settle();
-      hint_boost("rvc wake");
+      if (session && hint.workload_increase) hint.workload_increase(session, true, false, "rvc wake");
       engine_->reset_state();
-      if (opt_.warmup && !opt_.passthrough) warm_up(1);
-      play_local_.reset();
-      play_pipe_.reset();
-      seq = 0;
+      if (opt_.warmup && !opt_.passthrough) {
+        try {
+          std::fill(in.begin(), in.end(), 0.f);
+          auto tw = Clock::now();
+          engine_->process_block(in.data(), out.data());
+          RVC_LOGI("wake warm-up block %.0f ms", ms_since(tw));
+        } catch (...) {
+        }
+        engine_->reset_state();
+      }
+      in_zero_ms_ = 0;
+      last_block_ms_ = steady_ms();
+      first_block_pending_ = true;
       continue;
     }
     if (in_ring_.available() < static_cast<size_t>(block_)) {
@@ -567,19 +510,18 @@ void RealtimeDriver::worker_loop() {
       dropped_.fetch_add(block_);
     }
     in_ring_.read(in.data(), block_);
+    {
+      // what arrived: a silenced capture delivers exact zeros, which no real microphone does
+      float pk = 0.f;
+      for (float v : in) pk = std::max(pk, std::fabs(v));
+      in_peak_ = pk;
+      in_zero_ms_ = pk == 0.f ? in_zero_ms_.load() + 1000.0 * block_ / sr_ : 0.0;
+      last_block_ms_ = steady_ms();
+    }
     auto t0 = Clock::now();
-    // what is still waiting was captured after this block: that is how old its last sample is
-    auto t_in = t0 - std::chrono::microseconds(static_cast<int64_t>(1e6 * in_ring_.available() / sr_));
-    if (++seq % 8 == 1) measure_device_latency();
-    for (auto& st : stalls_)
-      if (st.first == seq) std::this_thread::sleep_for(std::chrono::milliseconds(st.second));
     if (opt_.passthrough) {
       out = in;
-      emit(out.data(), t_in, t0);
-      finish_block(ms_since(t0), 0, 0);
-      continue;
-    }
-    if (!pipelined_) {
+    } else {
       try {
         engine_->process_block(in.data(), out.data());
       } catch (const std::exception& e) {
@@ -587,78 +529,44 @@ void RealtimeDriver::worker_loop() {
         RVC_LOGE("process_block: %s", e.what());
         std::fill(out.begin(), out.end(), 0.f);
       }
-      emit(out.data(), t_in, t0);
-      finish_block(ms_since(t0), 0, 0);
-      continue;
     }
-    // two-stage: analyse here, hand the block to synth_loop (waits while it is still busy with
-    // the block before the previous one, which only happens when a stage is slower than realtime)
-    job.t_read = t0;
-    job.t_in = t_in;
-    job.ok = true;
-    try {
-      engine_->analyze(in.data(), job.frame);
-    } catch (const std::exception& e) {
-      job.ok = false;
-      set_error(e.what());
-      RVC_LOGE("analyze: %s", e.what());
-    }
-    {
-      std::unique_lock<std::mutex> lk(hand_mu_);
-      hand_cv_.wait(lk, [&] { return !slot_full_ || !running_.load(); });
-      if (!running_.load()) break;
-      std::swap(slot_, job);
-      slot_full_ = true;
-    }
-    hand_cv_.notify_all();
-  }
-}
-
-void RealtimeDriver::synth_loop() {
-  setpriority(PRIO_PROCESS, 0, -19);
-  pin_to_big_cores();
-  synth_tid_ = gettid();
-  for (int i = 0; i < 200 && worker_tid_.load() == 0 && running_.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  hint_open();
-  std::vector<float> out(block_);
-  Job job;
-  for (;;) {
-    {
-      std::unique_lock<std::mutex> lk(hand_mu_);
-      hand_cv_.wait(lk, [&] { return slot_full_ || !running_.load(); });
-      if (!running_.load()) break;
-      std::swap(job, slot_);
-      slot_full_ = false;
-      synth_busy_ = true;
-    }
-    hand_cv_.notify_all();
-    bool ok = job.ok;
-    if (ok) {
-      try {
-        engine_->synthesize(job.frame, out.data());
-      } catch (const std::exception& e) {
-        ok = false;
-        set_error(e.what());
-        RVC_LOGE("synthesize: %s", e.what());
+    double ms = ms_since(t0);
+    if (session) hint.report(session, static_cast<int64_t>(ms * 1e6));
+    if (opt_.output_gain != 1.f)
+      for (auto& v : out) v *= opt_.output_gain;
+    if (opt_.local_output) out_ring_.write(out.data(), out.size());
+    if (opt_.playback_fd >= 0) {
+      const char* p = reinterpret_cast<const char*>(out.data());
+      size_t left = out.size() * sizeof(float);
+      while (left > 0) {
+        ssize_t w = write(opt_.playback_fd, p, left);
+        if (w < 0) {
+          if (errno == EAGAIN) dropped_.fetch_add(static_cast<int64_t>(left / sizeof(float)));
+          else if (errno != EINTR) set_error("playback stream closed");
+          if (errno != EINTR) break;
+          continue;
+        }
+        p += w;
+        left -= static_cast<size_t>(w);
       }
     }
-    if (!ok) std::fill(out.begin(), out.end(), 0.f);
-    emit(out.data(), job.t_in, job.t_read);
-    finish_block(ms_since(job.t_read), job.frame.st.analyze_ms, job.frame.st.synth_ms);
-    {
-      std::lock_guard<std::mutex> lk(hand_mu_);
-      synth_busy_ = false;
-    }
-    hand_cv_.notify_all();
+    int64_t n = blocks_.fetch_add(1) + 1;
+    if (first_block_pending_.exchange(false))
+      RVC_LOGI("first converted block out (%.0f ms), input peak %.1f dB", ms, 20.0 * std::log10(std::max(in_peak_.load(), 1e-6f)));
+    avg = n == 1 ? ms : avg * 0.9 + ms * 0.1;
+    last_ms_ = ms;
+    avg_ms_ = avg;
+    if (n > 2) max_ms_ = std::max(max_ms_.load(), ms);
+    if (ms * 1e6 > block_ns) late_blocks_.fetch_add(1);
   }
+  if (session) hint.close(session);
 }
 
 Json RealtimeDriver::status() const {
   Json j = Json::object();
   j.set("running", running_.load());
   j.set("blocks", blocks_.load());
-  const double block_ms = 1000.0 * block_ / std::max(1, sr_);
-  j.set("block_ms", block_ms);
+  j.set("block_ms", 1000.0 * block_ / std::max(1, sr_));
   j.set("infer_ms", last_ms_.load());
   j.set("infer_avg_ms", avg_ms_.load());
   j.set("infer_max_ms", max_ms_.load());
@@ -673,7 +581,16 @@ Json RealtimeDriver::status() const {
   j.set("in_exclusive", in_exclusive_);
   j.set("out_exclusive", out_exclusive_);
   j.set("adpf", adpf().ok);
-  j.set("pipeline", pipelined_);
+  // capture health: is audio expected right now, when did the converter last get a block, and
+  // was it real sound
+  const int cm = capture_mode_.load();
+  const bool expecting = running_.load() && (cm < 0 ? opt_.local_input || opt_.capture_fd >= 0 : cm != 0);
+  j.set("capture_expected", expecting);
+  j.set("input_age_ms", last_block_ms_.load() > 0 ? static_cast<double>(steady_ms() - last_block_ms_.load()) : -1.0);
+  j.set("input_zero_ms", in_zero_ms_.load());
+  j.set("input_level_db", 20.0 * std::log10(std::max(in_peak_.load(), 1e-6f)));
+  j.set("input_reopens", input_reopens_.load());
+  j.set("output_reopens", output_reopens_.load());
   if (engine_ && engine_->loaded()) {
     BlockStats s = engine_->stats();
     Json st = Json::object();
@@ -684,32 +601,12 @@ Json RealtimeDriver::status() const {
     st.set("flow", s.flow_ms);
     st.set("dec", s.dec_ms);
     st.set("post", s.post_ms);
-    st.set("analyze", s.analyze_ms);
-    st.set("synth", s.synth_ms);
     st.set("sola_offset", s.sola_offset);
     j.set("stages", st);
-    // End-to-end delay, from its parts: a sample waits for its block to fill, for the block to
-    // be converted, in the output queue, for the SOLA overlap that is held back, and in the
-    // device buffers. The queue is measured, not assumed.
-    const PlayoutControl& pc = opt_.local_output ? play_local_ : play_pipe_;
-    const bool measured = opt_.playout_control && pc.delay_ms() > 0;
-    const double infer = avg_ms_.load();
-    const double queue = measured ? std::max(0.0, pc.delay_ms() - infer) : 1000.0 * out_ring_.available() / std::max(1, sr_);
-    const double sola = engine_->algorithmic_latency() * 1000.0 - block_ms;
-    // device buffers: as the streams report them, else two bursts each
-    const double in_io = in_device_ms_.load() >= 0 ? in_device_ms_.load() : 2000.0 * in_burst_ / std::max(1, sr_);
-    const double out_io = out_device_ms_.load() >= 0 ? out_device_ms_.load() : 2000.0 * out_burst_ / std::max(1, sr_);
-    const double io = in_io + out_io;
-    Json lat = Json::object();
-    lat.set("block", block_ms);
-    lat.set("infer", infer);
-    lat.set("queue", queue);
-    lat.set("sola", sola);
-    lat.set("io", io);
-    j.set("latency_parts", lat);
-    j.set("latency_ms", block_ms + infer + queue + sola + io);
-    j.set("trimmed_ms", 1000.0 * (play_local_.trimmed_frames() + play_pipe_.trimmed_frames()) / std::max(1, sr_));
-    j.set("padded_ms", 1000.0 * (play_local_.padded_frames() + play_pipe_.padded_frames()) / std::max(1, sr_));
+    // device-side latency estimate: block accumulation + inference + output buffering
+    double lat = 1000.0 * (block_ + engine_->algorithmic_latency() * sr_ - block_) / sr_ + avg_ms_.load() +
+                 1000.0 * (in_burst_ * 2 + out_burst_ * 2) / std::max(1, sr_);
+    j.set("latency_ms", lat);
   }
   {
     std::lock_guard<std::mutex> lk(err_mu_);

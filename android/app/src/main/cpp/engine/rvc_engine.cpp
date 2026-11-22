@@ -8,11 +8,6 @@
 #include "common.hpp"
 #include "ivf_index.hpp"
 #include "native_decoder.hpp"
-#include "thread_pool.hpp"
-
-#if defined(__ANDROID__) || defined(__linux__)
-#include <unistd.h>
-#endif
 
 namespace rvc {
 
@@ -24,7 +19,6 @@ struct RvcEngine::Worker {
   std::function<void()> job;
   std::exception_ptr err;
   bool pending = false, done = true, quit = false;
-  std::atomic<int> tid{0};
 
   Worker() { th = std::thread([this] { loop(); }); }
   ~Worker() {
@@ -51,9 +45,6 @@ struct RvcEngine::Worker {
     if (err) std::rethrow_exception(err);
   }
   void loop() {
-#if defined(__ANDROID__) || defined(__linux__)
-    tid = static_cast<int>(gettid());
-#endif
     std::unique_lock<std::mutex> lk(mu);
     for (;;) {
       cv.wait(lk, [&] { return pending || quit; });
@@ -146,6 +137,34 @@ RvcEngine::~RvcEngine() = default;
 
 static bool is_static_backend(Backend b) { return b != Backend::CPU && b != Backend::XNNPACK; }
 
+// A model's graph files are copies of the app's templates, made when the model was imported;
+// its weights.bin is laid out as the template's manifest says. When an app update ships
+// corrected graphs for the same layout (same manifest), the imported model takes them over:
+// nothing has to be imported again.
+static void refresh_graphs(const std::string& assets, const std::string& model_dir, const Json& meta) {
+  try {
+    const std::string tdir = join_path(join_path(assets, "synth"), meta.str_or("template", ""));
+    const std::string tman = join_path(tdir, "manifest.json"), mman = join_path(model_dir, "manifest.json");
+    if (!file_exists(tman) || !file_exists(mman)) return;
+    // same layout = same tensors at the same offsets (other fields of the manifest may differ)
+    const Json a = Json::parse(read_file(tman)), b = Json::parse(read_file(mman));
+    if (a.num_or("data_size", -1) != b.num_or("data_size", -2) || a["tensors"].dump() != b["tensors"].dump()) return;
+    const Json& graphs = meta["graphs"];
+    for (const char* k : {"enc", "flow", "dec"}) {
+      if (!graphs.get(k).is_string()) continue;
+      const std::string name = graphs[k].str(), src = join_path(tdir, name), dst = join_path(model_dir, name);
+      if (!file_exists(src)) continue;
+      std::string want = read_file(src);
+      if (file_exists(dst) && read_file(dst) == want) continue;
+      write_file(dst, want);
+      RVC_LOGI("model graph %s updated from the app's template", name.c_str());
+    }
+  } catch (const std::exception& e) {
+    RVC_LOGW("graph refresh skipped: %s", e.what());
+  }
+}
+
+
 void RvcEngine::load(const std::string& model_dir, const EngineConfig& cfg) {
   loaded_ = false;
   hubert_.reset();
@@ -155,11 +174,12 @@ void RvcEngine::load(const std::string& model_dir, const EngineConfig& cfg) {
   dec_.clear();
   native_dec_.reset();
   index_.reset();
-  pool_.reset();
-  worker_.reset();
   cfg_ = cfg;
   model_dir_ = model_dir;
+  dec_warning_.clear();
   meta_ = Json::parse(read_file(join_path(model_dir, "model.json")));
+  refresh_graphs(assets_, model_dir, meta_);
+  weights_salt_ = file_fingerprint(join_path(model_dir, "weights.bin"));
   tgt_sr_ = meta_["tgt_sr"].i32();
   upp_ = meta_["upp"].i32();
   phone_dim_ = meta_["phone_dim"].i32();
@@ -198,7 +218,6 @@ void RvcEngine::load(const std::string& model_dir, const EngineConfig& cfg) {
     fade_out_[i] = 1.f - fade_in_[i];
   }
   gate_ = SpectralGate(sr, 4 * zc_, 0.9f);  // as realtime_gui: TorchGate(sr, n_fft=4*zc, prop_decrease=0.9)
-  gate_out_ = gate_;
   res_in_ = SincResampler(sr, 16000);
   res_out_ = SincResampler(tgt_sr_, sr);
   res_formant_.clear();
@@ -208,7 +227,8 @@ void RvcEngine::load(const std::string& model_dir, const EngineConfig& cfg) {
   const Json& hg = hman["graphs"][phone_dim_ == 256 ? "hubert_v1" : "hubert_v2"];
   std::string hdir = join_path(assets_, "hubert");
   int N16 = static_cast<int>(input_wav_res_.size());
-  hubert_.reset(new OnnxModel(join_path(hdir, hg["fp32"].str()), cfg.hubert, {{"N", N16}}, "hubert_" + std::to_string(phone_dim_)));
+  hubert_.reset(new OnnxModel(join_path(hdir, hg["fp32"].str()), cfg.hubert, {{"N", N16}}, "hubert_" + std::to_string(phone_dim_),
+                              file_fingerprint(join_path(hdir, hman.str_or("data_file", "contentvec.bin")))));
   Json fman = Json::parse(read_file(join_path(assets_, "fcpe/manifest.json")));
   cent_table_.clear();
   for (auto& v : fman["cent_table"].items()) cent_table_.push_back(static_cast<float>(v.num()));
@@ -218,9 +238,9 @@ void RvcEngine::load(const std::string& model_dir, const EngineConfig& cfg) {
   const Json& g = meta_["graphs"];
   int p_len = N16 / 160;
   int flow_head = std::max(skip_head_ - 24, 0);
-  enc_.reset(new OnnxModel(join_path(model_dir, g["enc"].str()), cfg.synth, {{"T", p_len}}, meta_["template"].str() + "_enc"));
+  enc_.reset(new OnnxModel(join_path(model_dir, g["enc"].str()), cfg.synth, {{"T", p_len}}, meta_["template"].str() + "_enc", weights_salt_));
   flow_.reset(new OnnxModel(join_path(model_dir, g["flow"].str()), cfg.synth, {{"T", p_len - flow_head}},
-                            meta_["template"].str() + "_flow"));
+                            meta_["template"].str() + "_flow", weights_salt_));
   if (cfg.dec.backend == Backend::NATIVE && file_exists(join_path(model_dir, "manifest.json"))) {
     auto t = Clock::now();
     native_dec_.reset(new NativeDecoder(model_dir, g_, cfg.dec.threads, cfg.dec.fp16, cfg.dec.affinity));
@@ -231,22 +251,40 @@ void RvcEngine::load(const std::string& model_dir, const EngineConfig& cfg) {
   if (meta_.bool_or("has_index", false) && file_exists(join_path(model_dir, "index.bin")))
     index_.reset(new IvfIndex(join_path(model_dir, "index.bin")));
   worker_.reset(cfg.parallel_f0 ? new Worker() : nullptr);
-  pool_.reset(index_ ? new ThreadPool(std::max(1, std::min(4, cfg.synth.threads)), cfg.synth.affinity) : nullptr);
   reset_state();
   loaded_ = true;
 }
 
-OnnxModel& RvcEngine::dec_for(int rl2) {
+OnnxModel* RvcEngine::dec_for(int rl2) {
+  if (native_dec_) return nullptr;
   bool fixed = is_static_backend(cfg_.dec.backend);
   int key = fixed ? rl2 : 0;
   auto it = dec_.find(key);
-  if (it != dec_.end()) return *it->second;
+  if (it != dec_.end()) return it->second.get();
   const Json& g = meta_["graphs"];
   std::vector<std::pair<std::string, int64_t>> dims;
   if (fixed) dims = {{"T", rl2}, {"S", static_cast<int64_t>(rl2) * upp_}};
-  auto* m = new OnnxModel(join_path(model_dir_, g["dec"].str()), cfg_.dec, dims, meta_["template"].str() + "_dec");
-  dec_[key].reset(m);
-  return *m;
+  const std::string path = join_path(model_dir_, g["dec"].str()), tag = meta_["template"].str() + "_dec";
+  // An accelerator that cannot take the vocoder: ORT's CPU kernels would be the automatic
+  // fallback, but they run it several times slower than the NEON decoder (the vocoder is most
+  // of the work), usually too slow for realtime. Use the NEON decoder instead when it can
+  // run this model.
+  const bool native_ok = fixed && file_exists(join_path(model_dir_, "manifest.json"));
+  try {
+    auto* m = new OnnxModel(path, cfg_.dec, dims, tag, weights_salt_, !native_ok);
+    dec_[key].reset(m);
+    return m;
+  } catch (const std::exception& e) {
+    if (!native_ok) throw;
+    auto t = Clock::now();
+    native_dec_.reset(new NativeDecoder(model_dir_, g_, cfg_.dec.threads, cfg_.dec.fp16, cfg_.dec.affinity));
+    native_ms_ = ms_since(t);
+    dec_.clear();
+    dec_warning_ = std::string("声码器无法在所选的加速器上运行，已改用 CPU 原生 NEON（") + (native_dec_->fp16() ? "fp16" : "fp32") +
+                   "）。加速器给出的原因：\n" + e.what();
+    RVC_LOGW("vocoder: accelerator unavailable, using the native decoder");
+    return nullptr;
+  }
 }
 
 void RvcEngine::reset_state() {
@@ -300,37 +338,14 @@ Json RvcEngine::info() const {
   if (native_dec_) {
     be.set("dec", native_dec_->fp16() ? "native_fp16" : "native_fp32");
     load.set("dec", native_ms_);
+    if (!dec_warning_.empty()) warn.push(dec_warning_);
   } else if (!dec_.empty()) {
     add("dec", dec_.begin()->second.get());
   }
   j.set("backends", be);
-  j.set("independent_stages", stages_independent());
   j.set("load_ms", load);
   j.set("warnings", warn);
   return j;
-}
-
-// Which processor a backend computes on: 0 CPU, 1 GPU, 2 NPU, 3 NNAPI (vendor's choice).
-static int processor_of(const std::string& used) {
-  if (used == "webgpu" || used == "qnn_gpu") return 1;
-  if (used == "qnn_htp") return 2;
-  if (used == "nnapi") return 3;
-  return 0;
-}
-
-bool RvcEngine::stages_independent() const {
-  if (!loaded_ || !hubert_) return false;
-  int a = processor_of(hubert_->backend_used());
-  int b = native_dec_ ? 0 : dec_.empty() ? 0 : processor_of(dec_.begin()->second->backend_used());
-  return a != b;
-}
-
-std::vector<int> RvcEngine::helper_tids() const {
-  std::vector<int> t;
-  if (worker_ && worker_->tid.load() > 0) t.push_back(worker_->tid.load());
-  if (pool_) for (int id : pool_->tids()) t.push_back(id);
-  if (native_dec_) for (int id : native_dec_->tids()) t.push_back(id);
-  return t;
 }
 
 // ------------------------------------------------------------------ f0
@@ -398,62 +413,8 @@ void RvcEngine::make_har(const float* f0, int L, int64_t start_frame, float* har
   }
 }
 
-// ------------------------------------------------------------------ block, first half
-// realtime_gui.audio_callback up to the model call, then rtrvc.RVC.infer up to the synthesizer:
-// input gate / noise reduction / resampling, HuBERT + FCPE, retrieval, pitch cache.
-void RvcEngine::analyze(const float* in, Frame& f) {
-  if (!loaded_) throw Error("engine not loaded");
-  BlockStats& st = f.st;
-  st = BlockStats();
-  auto t_all = Clock::now();
-  const int bf = block_frame_, zc = zc_;
-  std::vector<float> indata(in, in + bf);
-  const float thr = params.threshold.load();
-  if (thr > -60) {
-    std::vector<float> buf(rms_buffer_);
-    buf.insert(buf.end(), indata.begin(), indata.end());
-    std::vector<float> rms = rms_frames(buf.data(), static_cast<int>(buf.size()), 4 * zc, zc);
-    std::copy(buf.end() - 4 * zc, buf.end(), rms_buffer_.begin());
-    std::vector<float> data(buf.begin() + (2 * zc - zc / 2), buf.end());
-    for (size_t i = 2; i < rms.size(); ++i) {
-      float db = 20.f * std::log10(std::max(rms[i], 1e-5f));
-      if (db < thr) {
-        size_t a = (i - 2) * zc, b = std::min(data.size(), a + zc);
-        for (size_t k = a; k < b; ++k) data[k] = 0;
-      }
-    }
-    indata.assign(data.begin() + zc / 2, data.end());
-  }
-  const int len = static_cast<int>(indata.size());
-  std::memmove(input_wav_.data(), input_wav_.data() + bf, sizeof(float) * (input_wav_.size() - bf));
-  std::copy(indata.begin(), indata.end(), input_wav_.end() - len);
-  std::memmove(input_wav_res_.data(), input_wav_res_.data() + block_frame_16k_, sizeof(float) * (input_wav_res_.size() - block_frame_16k_));
-  const bool inr = params.input_nr.load();
-  const int sb = sola_buffer_frame_;
-  if (inr) {
-    // input noise reduction (realtime_gui I_noise_reduce)
-    std::memmove(input_wav_denoise_.data(), input_wav_denoise_.data() + bf, sizeof(float) * (input_wav_denoise_.size() - bf));
-    std::vector<float> iw = gate_.process(input_wav_.data() + input_wav_.size() - sb - bf, sb + bf, input_wav_.data(),
-                                          static_cast<int>(input_wav_.size()));
-    for (int i = 0; i < sb; ++i) iw[i] = iw[i] * fade_in_[i] + nr_buffer_[i] * fade_out_[i];
-    std::copy(iw.begin(), iw.begin() + bf, input_wav_denoise_.end() - bf);
-    std::copy(iw.begin() + bf, iw.begin() + bf + sb, nr_buffer_.begin());
-    int rn = bf + 2 * zc;
-    std::vector<float> res = res_in_(input_wav_denoise_.data() + input_wav_denoise_.size() - rn, rn);
-    int nw = block_frame_16k_ + 160;
-    std::copy(res.begin() + 160, res.begin() + 160 + nw, input_wav_res_.end() - nw);
-  } else {
-    int rn = len + 2 * zc;
-    std::vector<float> res = res_in_(input_wav_.data() + input_wav_.size() - rn, rn);
-    int nw = 160 * (len / zc + 1);
-    std::copy(res.begin() + 160, res.begin() + 160 + nw, input_wav_res_.end() - nw);
-  }
-  // the loudness reference of this block; the next analyze() shifts these buffers
-  {
-    const std::vector<float>& ref = inr ? input_wav_denoise_ : input_wav_;
-    f.rms_ref.assign(ref.begin() + extra_frame_, ref.end());
-  }
-
+// ------------------------------------------------------------------ rtrvc.RVC.infer
+std::vector<float> RvcEngine::infer(BlockStats& st) {
   const int N16 = static_cast<int>(input_wav_res_.size());
   const float* x = input_wav_res_.data();
   const int n16 = block_frame_16k_ + 800;
@@ -467,27 +428,15 @@ void RvcEngine::analyze(const float* in, Frame& f) {
 
   // HuBERT / ContentVec
   auto t0 = Clock::now();
-  std::vector<float> feats;
-  int F = 0, D = 0;
-  try {
-    std::vector<Ort::Value> hin;
-    hin.push_back(make_tensor<float>(const_cast<float*>(x), static_cast<size_t>(N16), {1, N16}));
-    auto hout = hubert_->run({"audio"}, hin, {"feats"});
-    auto hs = hout[0].GetTensorTypeAndShapeInfo().GetShape();
-    F = static_cast<int>(hs[1]);
-    D = static_cast<int>(hs[2]);
-    feats.resize(static_cast<size_t>(F + 1) * D);
-    memcpy(feats.data(), hout[0].GetTensorData<float>(), sizeof(float) * F * D);
-    memcpy(feats.data() + static_cast<size_t>(F) * D, feats.data() + static_cast<size_t>(F - 1) * D, sizeof(float) * D);
-  } catch (...) {
-    if (worker_) {  // the f0 job references this stack frame: let it finish first
-      try {
-        worker_->wait();
-      } catch (...) {
-      }
-    }
-    throw;
-  }
+  std::vector<Ort::Value> hin;
+  hin.push_back(make_tensor<float>(const_cast<float*>(x), static_cast<size_t>(N16), {1, N16}));
+  auto hout = hubert_->run({"audio"}, hin, {"feats"});
+  auto hs = hout[0].GetTensorTypeAndShapeInfo().GetShape();
+  const int F = static_cast<int>(hs[1]), D = static_cast<int>(hs[2]);
+  std::vector<float> feats(static_cast<size_t>(F + 1) * D);
+  memcpy(feats.data(), hout[0].GetTensorData<float>(), sizeof(float) * F * D);
+  memcpy(feats.data() + static_cast<size_t>(F) * D, feats.data() + static_cast<size_t>(F - 1) * D, sizeof(float) * D);
+  hout.clear();
   st.hubert_ms = ms_since(t0);
 
   if (worker_) worker_->wait();
@@ -500,9 +449,9 @@ void RvcEngine::analyze(const float* in, Frame& f) {
     int s = skip_head_ / 2, rows = F + 1 - s;
     if (rows > 0) {
       std::vector<float> blend(static_cast<size_t>(rows) * D);
-      index_->search_blend(feats.data() + static_cast<size_t>(s) * D, rows, blend.data(), 8, cfg_.index_nprobe, pool_.get());
-      float* fp = feats.data() + static_cast<size_t>(s) * D;
-      for (size_t i = 0; i < blend.size(); ++i) fp[i] = blend[i] * index_rate + (1 - index_rate) * fp[i];
+      index_->search_blend(feats.data() + static_cast<size_t>(s) * D, rows, blend.data(), 8, cfg_.index_nprobe);
+      float* f = feats.data() + static_cast<size_t>(s) * D;
+      for (size_t i = 0; i < blend.size(); ++i) f[i] = blend[i] * index_rate + (1 - index_rate) * f[i];
     }
     st.index_ms = ms_since(t);
   }
@@ -555,35 +504,14 @@ void RvcEngine::analyze(const float* in, Frame& f) {
     }
   }
 
-  // synthesizer inputs (the pitch cache moves on with the next block)
-  f.dim = D;
-  f.formant = formant;
-  f.phone.resize(static_cast<size_t>(p_len) * D);
-  for (int t = 0; t < p_len; ++t) memcpy(f.phone.data() + static_cast<size_t>(t) * D, feats.data() + static_cast<size_t>(t / 2) * D, sizeof(float) * D);
-  f.pitch.assign(cache_pitch_.end() - p_len, cache_pitch_.end());
-  f.nsff0.resize(static_cast<size_t>(rl));
-  for (int i = 0; i < rl; ++i) f.nsff0[i] = cache_pitchf_[1024 - p_len + skip_head_ + i] * static_cast<float>(rl2) / static_cast<float>(rl);
-  st.analyze_ms = ms_since(t_all);
-}
-
-// ------------------------------------------------------------------ block, second half
-// rtrvc.RVC.infer from the synthesizer on (enc_p, flow, NSF source + decoder), then the rest of
-// realtime_gui.audio_callback: resampling, output noise reduction, loudness mixing, SOLA.
-void RvcEngine::synthesize(Frame& f, float* out) {
-  if (!loaded_) throw Error("engine not loaded");
-  BlockStats& st = f.st;
-  auto t_all = Clock::now();
-  const int bf = block_frame_, zc = zc_, sb = sola_buffer_frame_;
-  const int p_len = static_cast<int>(f.pitch.size()), D = f.dim;
-  const double factor = std::pow(2.0, f.formant / 12.0);
-  const int rl = return_length_;
-  const int rl2 = static_cast<int>(std::ceil(rl * factor));
-
   // synthesizer: enc_p
-  auto t0 = Clock::now();
+  t0 = Clock::now();
+  std::vector<float> phone(static_cast<size_t>(p_len) * D);
+  for (int t = 0; t < p_len; ++t) memcpy(phone.data() + static_cast<size_t>(t) * D, feats.data() + static_cast<size_t>(t / 2) * D, sizeof(float) * D);
+  std::vector<int64_t> cp(cache_pitch_.end() - p_len, cache_pitch_.end());
   std::vector<Ort::Value> ein;
-  ein.push_back(make_tensor<float>(f.phone.data(), f.phone.size(), {1, p_len, D}));
-  ein.push_back(make_tensor<int64_t>(f.pitch.data(), f.pitch.size(), {1, p_len}));
+  ein.push_back(make_tensor<float>(phone.data(), phone.size(), {1, p_len, D}));
+  ein.push_back(make_tensor<int64_t>(cp.data(), cp.size(), {1, p_len}));
   auto eout = enc_->run({"phone", "pitch"}, ein, {"m_p", "logs_p"});
   const float* m_p = eout[0].GetTensorData<float>();
   const float* logs_p = eout[1].GetTensorData<float>();
@@ -614,8 +542,10 @@ void RvcEngine::synthesize(Frame& f, float* out) {
 
   // NSF source + decoder
   t0 = Clock::now();
+  std::vector<float> nsff0(static_cast<size_t>(rl));
+  for (int i = 0; i < rl; ++i) nsff0[i] = cache_pitchf_[1024 - p_len + skip_head_ + i] * static_cast<float>(rl2) / static_cast<float>(rl);
   std::vector<float> har(static_cast<size_t>(rl) * upp_);
-  make_har(f.nsff0.data(), rl, phase_frames_ + skip_head_, har.data());
+  make_har(nsff0.data(), rl, phase_frames_ + skip_head_, har.data());
   if (rl2 != rl) {
     std::vector<float> h2(static_cast<size_t>(rl2) * upp_), z2(static_cast<size_t>(C) * rl2);
     interp_linear_rows(har.data(), 1, rl * upp_, h2.data(), rl2 * upp_);
@@ -623,17 +553,18 @@ void RvcEngine::synthesize(Frame& f, float* out) {
     har.swap(h2);
     z.swap(z2);
   }
-  std::vector<float> infer_wav(static_cast<size_t>(rl2) * upp_);
-  if (native_dec_) {
-    native_dec_->run(z.data(), rl2, har.data(), infer_wav.data());
+  std::vector<float> audio(static_cast<size_t>(rl2) * upp_);
+  OnnxModel* dec = dec_for(rl2);  // null: the native decoder is in use (possibly as of this call)
+  if (!dec) {
+    native_dec_->run(z.data(), rl2, har.data(), audio.data());
   } else {
     std::vector<Ort::Value> din;
     din.push_back(make_tensor<float>(z.data(), z.size(), {1, C, rl2}));
     din.push_back(make_tensor<float>(har.data(), har.size(), {1, 1, static_cast<int64_t>(rl2) * upp_}));
     din.push_back(make_tensor<float>(g_.data(), g_.size(), {1, static_cast<int64_t>(g_.size()), 1}));
-    auto dout = dec_for(rl2).run({"z", "har", "g"}, din, {"audio"});
+    auto dout = dec->run({"z", "har", "g"}, din, {"audio"});
     const float* au = dout[0].GetTensorData<float>();
-    std::copy(au, au + infer_wav.size(), infer_wav.begin());
+    std::copy(au, au + audio.size(), audio.begin());
   }
   st.dec_ms = ms_since(t0);
 
@@ -641,26 +572,78 @@ void RvcEngine::synthesize(Frame& f, float* out) {
   if (upp_res != tgt_sr_ / 100) {
     auto it = res_formant_.find(upp_res);
     if (it == res_formant_.end()) it = res_formant_.emplace(upp_res, SincResampler(upp_res, tgt_sr_ / 100)).first;
-    int nuse = std::min(static_cast<int>(infer_wav.size()), rl * upp_res);
-    infer_wav = it->second(infer_wav.data(), nuse);
+    int nuse = std::min(static_cast<int>(audio.size()), rl * upp_res);
+    audio = it->second(audio.data(), nuse);
   }
-  phase_frames_ += block_frame_ / zc_;
+  return audio;
+}
 
+// ------------------------------------------------------------------ realtime_gui.audio_callback
+void RvcEngine::process_block(const float* in, float* out) {
+  if (!loaded_) throw Error("engine not loaded");
+  BlockStats st;
+  auto t_all = Clock::now();
+  const int bf = block_frame_, zc = zc_;
+  std::vector<float> indata(in, in + bf);
+  const float thr = params.threshold.load();
+  if (thr > -60) {
+    std::vector<float> buf(rms_buffer_);
+    buf.insert(buf.end(), indata.begin(), indata.end());
+    std::vector<float> rms = rms_frames(buf.data(), static_cast<int>(buf.size()), 4 * zc, zc);
+    std::copy(buf.end() - 4 * zc, buf.end(), rms_buffer_.begin());
+    std::vector<float> data(buf.begin() + (2 * zc - zc / 2), buf.end());
+    for (size_t i = 2; i < rms.size(); ++i) {
+      float db = 20.f * std::log10(std::max(rms[i], 1e-5f));
+      if (db < thr) {
+        size_t a = (i - 2) * zc, b = std::min(data.size(), a + zc);
+        for (size_t k = a; k < b; ++k) data[k] = 0;
+      }
+    }
+    indata.assign(data.begin() + zc / 2, data.end());
+  }
+  const int len = static_cast<int>(indata.size());
+  std::memmove(input_wav_.data(), input_wav_.data() + bf, sizeof(float) * (input_wav_.size() - bf));
+  std::copy(indata.begin(), indata.end(), input_wav_.end() - len);
+  std::memmove(input_wav_res_.data(), input_wav_res_.data() + block_frame_16k_, sizeof(float) * (input_wav_res_.size() - block_frame_16k_));
+  const bool inr = params.input_nr.load();
+  const int sb = sola_buffer_frame_;
+  if (inr) {
+    // input noise reduction (realtime_gui I_noise_reduce)
+    std::memmove(input_wav_denoise_.data(), input_wav_denoise_.data() + bf, sizeof(float) * (input_wav_denoise_.size() - bf));
+    std::vector<float> iw = gate_.process(input_wav_.data() + input_wav_.size() - sb - bf, sb + bf, input_wav_.data(),
+                                          static_cast<int>(input_wav_.size()));
+    for (int i = 0; i < sb; ++i) iw[i] = iw[i] * fade_in_[i] + nr_buffer_[i] * fade_out_[i];
+    std::copy(iw.begin(), iw.begin() + bf, input_wav_denoise_.end() - bf);
+    std::copy(iw.begin() + bf, iw.begin() + bf + sb, nr_buffer_.begin());
+    int rn = bf + 2 * zc;
+    std::vector<float> res = res_in_(input_wav_denoise_.data() + input_wav_denoise_.size() - rn, rn);
+    int nw = block_frame_16k_ + 160;
+    std::copy(res.begin() + 160, res.begin() + 160 + nw, input_wav_res_.end() - nw);
+  } else {
+    int rn = len + 2 * zc;
+    std::vector<float> res = res_in_(input_wav_.data() + input_wav_.size() - rn, rn);
+    int nw = 160 * (len / zc + 1);
+    std::copy(res.begin() + 160, res.begin() + 160 + nw, input_wav_res_.end() - nw);
+  }
+
+  std::vector<float> infer_wav = infer(st);
+  phase_frames_ += block_frame_ / zc_;
   auto t_post = Clock::now();
   if (!res_out_.identity()) infer_wav = res_out_(infer_wav.data(), static_cast<int>(infer_wav.size()));
   if (params.output_nr.load()) {
     // output noise reduction (realtime_gui O_noise_reduce)
     std::memmove(output_buffer_.data(), output_buffer_.data() + bf, sizeof(float) * (output_buffer_.size() - bf));
     std::copy(infer_wav.end() - bf, infer_wav.end(), output_buffer_.end() - bf);
-    infer_wav = gate_out_.process(infer_wav.data(), static_cast<int>(infer_wav.size()), output_buffer_.data(),
-                                  static_cast<int>(output_buffer_.size()));
+    infer_wav = gate_.process(infer_wav.data(), static_cast<int>(infer_wav.size()), output_buffer_.data(),
+                              static_cast<int>(output_buffer_.size()));
   }
   const int n = static_cast<int>(infer_wav.size());
 
   const float rmr = params.rms_mix_rate.load();
   if (rmr < 1) {
-    int niw = std::min(n, static_cast<int>(f.rms_ref.size()));
-    std::vector<float> r1 = interp_linear_align(rms_frames(f.rms_ref.data(), niw, 4 * zc, zc), n + 1);
+    const float* iw = (inr ? input_wav_denoise_.data() : input_wav_.data()) + extra_frame_;
+    int niw = std::min(n, static_cast<int>(input_wav_.size()) - extra_frame_);
+    std::vector<float> r1 = interp_linear_align(rms_frames(iw, niw, 4 * zc, zc), n + 1);
     std::vector<float> r2 = interp_linear_align(rms_frames(infer_wav.data(), n, 4 * zc, zc), n + 1);
     const float e = 1.f - rmr;
     for (int i = 0; i < n; ++i) infer_wav[i] *= std::pow(r1[i] / std::max(r2[i], 1e-3f), e);
@@ -689,17 +672,11 @@ void RvcEngine::synthesize(Frame& f, float* out) {
   std::copy(w, w + bf, out);
 
   st.post_ms = ms_since(t_post);
-  st.synth_ms = ms_since(t_all);
-  st.total_ms = st.analyze_ms + st.synth_ms;
+  st.total_ms = ms_since(t_all);
   st.sola_offset = best;
   std::lock_guard<std::mutex> lk(stats_mu_);
   st.blocks = stats_.blocks + 1;
   stats_ = st;
-}
-
-void RvcEngine::process_block(const float* in, float* out) {
-  analyze(in, frame_);
-  synthesize(frame_, out);
 }
 
 }  // namespace rvc

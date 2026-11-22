@@ -32,8 +32,13 @@ Ort::Env& ort_env();
 class OnnxModel {
  public:
   // free_dims: symbolic input dimensions fixed for this session (static shapes for accelerators).
+  // cache_salt: whatever else decides what the compiled graph computes, i.e. a fingerprint of
+  //   the weight file the graph refers to (compiled accelerator graphs have the weights baked in).
+  // cpu_fallback: when the accelerator cannot take the model, run it on ORT's CPU provider
+  //   (true), or throw so that the caller can pick something better (false).
   OnnxModel(const std::string& path, const BackendConfig& cfg,
-            const std::vector<std::pair<std::string, int64_t>>& free_dims, const std::string& tag);
+            const std::vector<std::pair<std::string, int64_t>>& free_dims, const std::string& tag,
+            const std::string& cache_salt = "", bool cpu_fallback = true);
 
   std::vector<Ort::Value> run(const std::vector<const char*>& in_names, const std::vector<Ort::Value>& inputs,
                               const std::vector<const char*>& out_names);
@@ -46,8 +51,14 @@ class OnnxModel {
   std::string used_, warning_;
   double load_ms_ = 0;
   void create(const std::string& path, const BackendConfig& cfg,
-              const std::vector<std::pair<std::string, int64_t>>& free_dims, const std::string& tag);
+              const std::vector<std::pair<std::string, int64_t>>& free_dims, const std::string& tag,
+              const std::string& cache_salt, bool diagnose);
 };
+
+// "size-mtime-hash" of a file, cheap also for large ones (hashes the first and last 256 KiB).
+std::string file_fingerprint(const std::string& path);
+// SoC name as the system reports it (e.g. "SM8635"), empty off Android.
+std::string soc_name();
 
 Ort::MemoryInfo& cpu_mem();
 

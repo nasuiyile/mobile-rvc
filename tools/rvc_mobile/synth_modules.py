@@ -306,6 +306,47 @@ class ResBlock2(nn.Module):
         return x
 
 
+def _source_conv(conv: Conv1d, har: torch.Tensor) -> torch.Tensor:
+    """``conv(har)`` for the decoder's noise convolutions, without a convolution over a
+    single input channel.
+
+    ``har`` has one channel and these are the only such convolutions in the model. NPU back
+    ends are built for many-channel convolutions and may refuse them (QNN HTP on a Snapdragon
+    8s Gen 3 does), and one refused convolution is fatal with ONNX Runtime: the node has been
+    rewritten to NHWC for the accelerator by then and no other provider can take it. Both
+    forms below compute exactly the same sums as the convolution:
+
+    * kernel 1 is a gain and an offset per output channel: ``har * w + b``;
+    * kernel ``2s``, stride ``s``, padding ``s/2`` (``s`` even) reads ``har`` in steps of
+      ``s``. With ``X[p, n] = har[n*s + p]`` (the ``s`` polyphase components, a sequence
+      ``s`` times shorter) it is an ordinary 3-tap convolution over ``s`` channels:
+      ``y[c, m] = sum_p sum_q W[c, q*s + p + s/2] * X[p, m + q]``, ``q`` in -1..1,
+      where taps outside ``0..2s-1`` are zero.
+
+    The weights stay the checkpoint's tensors; their rearrangement is part of the graph and
+    is folded when the session is created.
+    """
+    w, b = conv.weight, conv.bias
+    cout, cin, k = w.shape
+    assert cin == 1 and conv.dilation == 1
+    if k == 1:
+        assert conv.stride == 1 and conv.padding == 0
+        return har * w.reshape(1, cout, 1) + b.reshape(1, cout, 1)
+    s = conv.stride
+    assert k == 2 * s and s % 2 == 0 and conv.padding == s // 2
+    x = har.reshape(1, -1, s).transpose(1, 2)                        # [1, s, S/s]
+    wp = F.pad(w, (s // 2, s // 2)).reshape(cout, 3, s).transpose(1, 2)  # [cout, s, 3]
+    return F.conv1d(x, wp, b, 1, 1)
+
+
+def _point_conv(conv: Conv1d, g: torch.Tensor) -> torch.Tensor:
+    """``conv(g)`` for a kernel-1 convolution over a length-1 sequence (the speaker
+    embedding): a matrix product, which every back end has."""
+    w, b = conv.weight, conv.bias
+    assert w.shape[2] == 1 and conv.stride == 1 and conv.padding == 0
+    return torch.matmul(w.reshape(w.shape[0], w.shape[1]), g) + b.reshape(1, -1, 1)
+
+
 class GeneratorNSF(nn.Module):
     """NSF-HiFiGAN decoder; ``har`` is the (already tanh(linear)-merged) sine source."""
 
@@ -336,11 +377,11 @@ class GeneratorNSF(nn.Module):
         self.cond = Conv1d(gin_channels, upsample_initial_channel, 1)
 
     def forward(self, x, har, g):
-        x = self.conv_pre(x) + self.cond(g)
+        x = self.conv_pre(x) + _point_conv(self.cond, g)
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, LRELU_SLOPE)
             x = self.ups[i](x)
-            x = x + self.noise_convs[i](har)
+            x = x + _source_conv(self.noise_convs[i], har)
             xs = None
             for j in range(self.num_kernels):
                 r = self.resblocks[i * self.num_kernels + j](x)

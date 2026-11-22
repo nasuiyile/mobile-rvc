@@ -124,12 +124,8 @@ int main(int argc, char** argv) {
     }
 #ifdef __ANDROID__
     if (cmd == "pipetest" && argc >= 6) {
-      // realtime driver fed through the capture pipe, input paced in real time:
+      // realtime driver in virtual-mic (pipe) mode, input paced in real time:
       // pipetest <assets> <model_dir> <in.wav> <out.wav> [k=v ...]
-      // Driver options go in as drv.<key>=<value>. By default the output is what arrives on the
-      // playback pipe (virtual-mic mode); with drv.sim_output=true it is what a simulated audio
-      // device played from the local output queue, on the same clock as the input (so the two
-      // files can be compared sample by sample to measure the end-to-end delay).
       Json live = Json::object();
       Json cj = parse_overrides(Json::object(), argc, argv, 6, &live);
       int sr = 0;
@@ -142,14 +138,11 @@ int main(int argc, char** argv) {
       if (pipe(cap) || pipe(play)) throw Error("pipe");
       fcntl(play[1], F_SETPIPE_SZ, 1 << 20);
       RealtimeDriver d(&e);
-      DriverOptions o = DriverOptions::from_json(cj.get("drv").is_object() ? cj["drv"] : Json::object());
+      DriverOptions o;
       o.local_input = false;
+      o.local_output = false;
       o.capture_fd = cap[0];
-      const bool sim = o.sim_output;
-      o.local_output = sim;
-      if (sim) o.sim_record = argv[5];
-      o.playback_fd = sim ? -1 : play[1];
-      if (sim) close(play[1]);
+      o.playback_fd = play[1];
       d.start(o);
       std::vector<float> y;
       std::thread reader([&] {
@@ -162,19 +155,12 @@ int main(int argc, char** argv) {
       });
       const int chunk = sr / 100;
       const bool toggle = cj.bool_or("toggle_input", false);
-      const int report_every = static_cast<int>(cj.num_or("report_s", 0)) * sr;
       auto t0 = Clock::now();
       for (size_t i = 0; i + chunk <= x.size(); i += chunk) {
         if (toggle && i % (sr * 2) == 0) {  // exercise runtime open/close of the local mic
           bool on = (i / (sr * 2)) % 2 == 0;
           d.set_capture_mode(on ? 1 : 0);
           printf("t=%.1fs local mic %s\n", static_cast<double>(i) / sr, on ? "on" : "off");
-        }
-        if (report_every > 0 && i > 0 && i % report_every == 0) {
-          Json st = d.status();
-          printf("t=%.0fs delay %.0f ms %s underruns %lld trimmed %.0f padded %.0f ms\n", static_cast<double>(i) / sr,
-                 st.num_or("latency_ms", 0), st.get("latency_parts").dump().c_str(),
-                 static_cast<long long>(st.num_or("out_underruns", 0)), st.num_or("trimmed_ms", 0), st.num_or("padded_ms", 0));
         }
         if (write(cap[1], x.data() + i, chunk * 4) < 0) break;
         auto due = t0 + std::chrono::microseconds(static_cast<int64_t>(1e6 * (i + chunk) / sr));
@@ -186,7 +172,7 @@ int main(int argc, char** argv) {
       close(cap[1]);
       reader.join();
       close(play[0]);
-      if (!sim) write_wav_f32(argv[5], y, sr);
+      write_wav_f32(argv[5], y, sr);
       printf("%s\nout_samples=%zu in_samples=%zu\n", st.dump().c_str(), y.size(), x.size());
       return 0;
     }
@@ -284,6 +270,20 @@ int main(int argc, char** argv) {
         double num = 0, den = 0;
         for (size_t i = 0; i < o.size(); ++i) { double d = o[i] - y[i]; num += d * d; den += double(y[i]) * y[i]; }
         printf("native %s: snr %.1f dB vs ORT fp32, %.1f ms\n", f16 ? "fp16" : "fp32", 10 * log10(den / std::max(num, 1e-30)), ms);
+      }
+      return 0;
+    }
+    if (cmd == "failtest" && argc >= 4) {
+      // failtest <model_dir> <backend>: a session that cannot be built (inconsistent static
+      // shapes), to look at what the wrapper reports for an accelerator failure
+      BackendConfig ac;
+      ac.backend = backend_from_name(argv[3]);
+      ac.threads = 2;
+      try {
+        OnnxModel m(join_path(argv[2], "dec.onnx"), ac, {{"T", 35}, {"S", 13001}}, "failtest_dec", "", false);
+        printf("unexpectedly built on %s\n", m.backend_used().c_str());
+      } catch (const std::exception& e) {
+        printf("reported failure:\n%s\n", e.what());
       }
       return 0;
     }

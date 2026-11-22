@@ -44,6 +44,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -220,9 +221,32 @@ private fun Screen() {
         c.importModel(pth, idx)
     }
     c.shared?.let { sh -> SharedFilesDialog(sh) }
-    c.message?.let { msg ->
-        AlertDialog(onDismissRequest = { c.message = null }, confirmButton = { TextButton({ c.message = null }) { Text("确定") } }, text = { Text(msg) })
-    }
+    c.message?.let { msg -> MessageDialog(msg) { c.message = null } }
+}
+
+/**
+ * Messages can be long (an accelerator's refusal comes with its log): the text scrolls, can be
+ * selected, and "复制" puts all of it on the clipboard so it can be sent on as text.
+ */
+@Composable
+private fun MessageDialog(msg: String, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    AlertDialog(
+        onDismissRequest = onClose,
+        confirmButton = { TextButton(onClose) { Text("确定") } },
+        dismissButton = {
+            if (msg.length > 120) TextButton({
+                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("rvc", msg))
+            }) { Text("复制") }
+        },
+        text = {
+            SelectionContainer {
+                Text(msg, Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+                    style = if (msg.length > 300) MaterialTheme.typography.bodySmall else MaterialTheme.typography.bodyMedium)
+            }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------- fixed bars
@@ -333,21 +357,32 @@ private fun StatusStrip() {
             Chevron(!details)  // the details open upwards
         }
         st?.optString("error")?.takeIf { it.isNotEmpty() }?.let { Text("错误：$it", style = small, color = MaterialTheme.colorScheme.error) }
+        // a recording that converts nothing: say so instead of showing a healthy-looking delay
+        if (st != null && active && st.optBoolean("capture_expected")) {
+            val shell = st.optJSONObject("shell")
+            val warn = when {
+                st.optDouble("input_age_ms", -1.0) > 1500 -> "没有收到麦克风数据，正在重新连接采集…"
+                st.optDouble("input_zero_ms", 0.0) > 1500 || shell?.optBoolean("app_silenced") == true && c.captureMode == 1 ||
+                    shell?.optBoolean("shell_silenced") == true && c.captureMode == 2 ->
+                    "采集到的是纯静音：麦克风被系统静音，或被别的应用占用"
+                shell?.optBoolean("victim_silenced") == true -> "对方应用的录音被系统静音了（它不在前台，或麦克风被别的应用占用）"
+                else -> null
+            }
+            if (warn != null) Text(warn, Modifier.padding(start = 16.dp), style = small, color = MaterialTheme.colorScheme.error)
+        }
         AnimatedVisibility(details && st != null) {
             Column(Modifier.padding(start = 16.dp, top = 4.dp), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                st?.optJSONObject("latency_parts")?.let {
-                    Text("采样 %.0f + 推理 %.0f + 缓冲 %.0f + 拼接 %.0f + 声卡 %.0f ms".format(
-                        it.optDouble("block"), it.optDouble("infer"), it.optDouble("queue"), it.optDouble("sola"), it.optDouble("io")), style = small)
-                }
+                Text("算法延迟 %.0f ms".format(st?.optJSONObject("engine")?.optDouble("latency_ms") ?: 0.0), style = small)
                 st?.optJSONObject("stages")?.let {
                     Text("HuBERT %.0f · FCPE %.0f · 索引 %.0f · 编码 %.0f · 流 %.0f · 声码器 %.0f ms".format(
                         it.optDouble("hubert"), it.optDouble("f0"), it.optDouble("index"), it.optDouble("enc"), it.optDouble("flow"), it.optDouble("dec")),
                         style = small, color = dim)
                 }
-                Text("后端 ${backendSummary(st?.optJSONObject("engine")?.optJSONObject("backends"))}" +
-                    if (st?.optBoolean("pipeline") == true) " · 两段并行" else "", style = small, color = dim)
-                Text("超时块 ${st?.optLong("late_blocks")} · 欠载 ${st?.optLong("out_underruns")} · 丢弃 ${st?.optLong("dropped_samples")} 采样" +
-                    " · 停顿处回收 %.0f ms".format(st?.optDouble("trimmed_ms", 0.0) ?: 0.0), style = small, color = dim)
+                Text("后端 ${backendSummary(st?.optJSONObject("engine")?.optJSONObject("backends"))}", style = small, color = dim)
+                Text("超时块 ${st?.optLong("late_blocks")} · 欠载 ${st?.optLong("out_underruns")} · 丢弃 ${st?.optLong("dropped_samples")} 采样", style = small, color = dim)
+                val reopens = (st?.optLong("input_reopens") ?: 0) + (st?.optLong("output_reopens") ?: 0)
+                Text("输入电平 %.0f dB".format(st?.optDouble("input_level_db", -120.0) ?: -120.0) +
+                    if (reopens > 0) " · 音频流重连 $reopens 次" else "", style = small, color = dim)
                 st?.optJSONObject("shell")?.let { sh ->
                     Text("注入：采集 ${sh.optLong("captured")} / 注入 ${sh.optLong("injected")} 采样${sh.optString("error").let { e -> if (e.isNotEmpty()) " · $e" else "" }}",
                         style = small, color = dim)
@@ -444,7 +479,7 @@ private fun PerformanceSection() {
         SwitchRow("NSF 相位跨块连续", "实验功能", s.phaseLock) { v -> c.update { it.copy(phaseLock = v) } }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             SmallButton("性能测试", enabled = !c.running && c.busy == null && s.modelId.isNotEmpty()) { c.bench() }
-            if (c.benchResult == null) Caption("测出每块耗时，并给出可用的采样长度")
+            if (c.benchResult == null) Caption("测出每块的推理耗时")
         }
         c.benchResult?.let {
             Text(it, Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest).padding(10.dp),
