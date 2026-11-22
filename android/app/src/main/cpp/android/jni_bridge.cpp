@@ -1,6 +1,7 @@
 // JNI surface for com.mobilervc.engine.Native (all results are JSON strings).
 #include <fcntl.h>
 #include <jni.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include <memory>
@@ -148,13 +149,15 @@ JNIEXPORT jstring JNICALL Java_com_mobilervc_engine_Native_bench(JNIEnv* env, jc
     std::vector<float> in(bf), out(bf);
     for (int i = 0; i < bf; ++i) in[i] = 0.2f * std::sin(2 * M_PI * 220.0 * i / sr);
     for (int i = 0; i < 3; ++i) e.process_block(in.data(), out.data());
-    double tot = 0, worst = 0, dec = 0, hub = 0;
+    double tot = 0, worst = 0, dec = 0, hub = 0, ana = 0, syn = 0;
     for (int i = 0; i < iters; ++i) {
       e.process_block(in.data(), out.data());
       BlockStats s = e.stats();
       tot += s.total_ms;
       dec += s.dec_ms;
       hub += s.hubert_ms;
+      ana += s.analyze_ms;
+      syn += s.synth_ms;
       worst = std::max(worst, s.total_ms);
     }
     e.reset_state();
@@ -166,6 +169,15 @@ JNIEXPORT jstring JNICALL Java_com_mobilervc_engine_Native_bench(JNIEnv* env, jc
     r.set("hubert_ms", hub / iters);
     r.set("dec_ms", dec / iters);
     r.set("rtf", tot / iters / bms);
+    r.set("analyze_ms", ana / iters);
+    r.set("synth_ms", syn / iters);
+    // What has to fit into one block period: both halves, or only the slower one when they run
+    // on different processors and overlap. A shorter block is also cheaper, so a block of
+    // (that time / 0.65) is safe to try.
+    const bool indep = e.stages_independent();
+    const double need = indep ? std::max(ana, syn) / iters : tot / iters;
+    r.set("independent_stages", indep);
+    r.set("suggest_block_ms", std::max(100.0, std::ceil(need / 0.65 / 10.0) * 10.0));  // 0.10 s: the UI's minimum
     r.set("engine", e.info());
     return jstr(env, r.dump());
   } catch (const std::exception& ex) {
@@ -182,6 +194,18 @@ JNIEXPORT jstring JNICALL Java_com_mobilervc_engine_Native_deviceInfo(JNIEnv* en
   }
   j.set("providers", p);
   j.set("fp16", fp16_supported());
+  // The driver sizes the virtual-mic output delay from the unread bytes in its pipe (FIONREAD);
+  // record whether this process may ask (ioctls on pipes are filtered by SELinux).
+  int fds[2] = {-1, -1}, pending = -1;
+  bool fionread = false;
+  if (pipe2(fds, O_CLOEXEC) == 0) {
+    char probe[8] = {0};
+    fionread = write(fds[1], probe, sizeof(probe)) == sizeof(probe) && ioctl(fds[1], FIONREAD, &pending) == 0 && pending == sizeof(probe);
+    close(fds[0]);
+    close(fds[1]);
+  }
+  j.set("pipe_fionread", fionread);
+  RVC_LOGI("device: %s", j.dump().c_str());
   return jstr(env, j.dump());
 }
 

@@ -24,6 +24,7 @@ class NativeDecoder {
   bool fp16() const { return fp16_; }
   int upp() const { return upp_; }
   int in_channels() const { return cin_; }
+  std::vector<int> tids() const;  // kernel thread ids of the worker pool
   // z: [in_channels][T] (row-major), har: [T*upp]; out: [T*upp]
   void run(const float* z, int T, const float* har, float* out);
 

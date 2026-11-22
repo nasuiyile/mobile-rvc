@@ -243,6 +243,17 @@ object RvcController {
     private fun startBlocking(): String? {
         stopBlocking()
         ensureLoaded()?.let { return it }
+        // Native.start() runs two silent blocks first, so the slow first inferences (GPU shader
+        // compilation, NPU wake-up) are over before audio starts
+        busy = "预热模型…"
+        try {
+            return startStreams()
+        } finally {
+            busy = null
+        }
+    }
+
+    private fun startStreams(): String? {
         val s = settings
         val opts = JSONObject()
             .put("input_preset", CAPTURE_PRESET)
@@ -334,10 +345,17 @@ object RvcController {
         busy = null
         benchResult = if (r.has("error")) r.getString("error") else {
             val be = r.optJSONObject("engine")?.optJSONObject("backends")
-            "每块 %.0f ms：平均 %.1f ms（HuBERT %.1f / 声码器 %.1f），最慢 %.1f ms，实时率 %.2f\n后端：%s".format(
+            val indep = r.optBoolean("independent_stages")
+            val suggest = r.optDouble("suggest_block_ms", 0.0)
+            "每块 %.0f ms：平均 %.1f ms（HuBERT %.1f / 声码器 %.1f），最慢 %.1f ms，实时率 %.2f\n".format(
                 r.getDouble("block_ms"), r.getDouble("avg_ms"), r.getDouble("hubert_ms"), r.getDouble("dec_ms"),
-                r.getDouble("worst_ms"), r.getDouble("rtf"), be?.toString() ?: "-",
-            )
+                r.getDouble("worst_ms"), r.getDouble("rtf"),
+            ) + "分析 %.1f ms / 合成 %.1f ms，%s\n".format(
+                r.optDouble("analyze_ms"), r.optDouble("synth_ms"),
+                if (indep) "两段在不同处理器上，实时运行时并行" else "两段在同一处理器上，顺序执行",
+            ) + (if (suggest > 0 && suggest < r.getDouble("block_ms") - 5)
+                "采样长度可以试着降到 %.2f s 左右以降低延迟（降低后再测一次，实时率保持在 0.8 以下）\n".format(suggest / 1000.0)
+            else "") + "后端：${be?.toString() ?: "-"}"
         }
     }
 }

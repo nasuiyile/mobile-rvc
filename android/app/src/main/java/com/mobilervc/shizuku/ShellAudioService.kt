@@ -418,8 +418,10 @@ class ShellAudioService() : IShellAudio.Stub() {
         injectThread = Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             val frames = sr / 100
-            val buf = ByteBuffer.allocateDirect(frames * 4 * 8).order(ByteOrder.nativeOrder())
-            val pcm = ShortArray(frames * 8)
+            // Read in small pieces (20 ms): the app sizes its output delay from how much is
+            // still unread in this pipe, so audio must not sit here in a large private buffer.
+            val buf = ByteBuffer.allocateDirect(frames * 4 * 2).order(ByteOrder.nativeOrder())
+            val pcm = ShortArray(frames * 2)
             val fis = java.io.FileInputStream(input)
             val silence = ShortArray(sr / 200)  // 5 ms
             var written = 0L  // frames written to the track (silence + audio)

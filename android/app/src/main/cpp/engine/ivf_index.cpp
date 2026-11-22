@@ -7,6 +7,7 @@
 
 #include "common.hpp"
 #include "pth_reader.hpp"  // MappedFile
+#include "thread_pool.hpp"
 
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -191,57 +192,62 @@ IvfIndex::IvfIndex(const std::string& path) : file_(new MappedFile(path)) {
 
 IvfIndex::~IvfIndex() = default;
 
-void IvfIndex::search_blend(const float* q, int n, float* out, int k, int nprobe) const {
+void IvfIndex::search_blend(const float* q, int n, float* out, int k, int nprobe, ThreadPool* pool) const {
   if (nprobe <= 0) nprobe = nprobe_;
   nprobe = std::min(nprobe, nlist_);
-  std::vector<std::pair<float, int>> cd(nlist_);
-  std::vector<std::pair<float, int64_t>> best;
-  std::vector<float> acc(dim_);
-  for (int r = 0; r < n; ++r) {
-    const float* x = q + static_cast<size_t>(r) * dim_;
-    for (int i = 0; i < nlist_; ++i) cd[i] = {cnorm_[i] - 2.f * dot(centroids_ + static_cast<size_t>(i) * dim_, x, dim_), i};
-    std::partial_sort(cd.begin(), cd.begin() + nprobe, cd.end());
-    best.clear();
-    for (int pi = 0; pi < nprobe; ++pi) {
-      int l = cd[pi].second;
-      for (uint64_t v = offsets_[l]; v < offsets_[l + 1]; ++v) {
-        float dist = f16_ ? l2_f16(x, vec16_ + v * dim_, dim_) : l2_f32(x, vec32_ + v * dim_, dim_);
-        if (static_cast<int>(best.size()) < k) {
-          best.emplace_back(dist, static_cast<int64_t>(v));
-          std::push_heap(best.begin(), best.end());
-        } else if (dist < best.front().first) {
-          std::pop_heap(best.begin(), best.end());
-          best.back() = {dist, static_cast<int64_t>(v)};
-          std::push_heap(best.begin(), best.end());
-        }
+  auto row = [&](int r) { search_row(q + static_cast<size_t>(r) * dim_, out + static_cast<size_t>(r) * dim_, k, nprobe); };
+  if (pool && n > 1) pool->parallel_for(n, row);
+  else for (int r = 0; r < n; ++r) row(r);
+}
+
+void IvfIndex::search_row(const float* x, float* o, int k, int nprobe) const {
+  // per-thread scratch (rows of one block are spread over the pool)
+  thread_local std::vector<std::pair<float, int>> cd;
+  thread_local std::vector<std::pair<float, int64_t>> best;
+  thread_local std::vector<float> acc;
+  cd.resize(nlist_);
+  acc.resize(dim_);
+  for (int i = 0; i < nlist_; ++i) cd[i] = {cnorm_[i] - 2.f * dot(centroids_ + static_cast<size_t>(i) * dim_, x, dim_), i};
+  std::partial_sort(cd.begin(), cd.begin() + nprobe, cd.end());
+  best.clear();
+  for (int pi = 0; pi < nprobe; ++pi) {
+    int l = cd[pi].second;
+    for (uint64_t v = offsets_[l]; v < offsets_[l + 1]; ++v) {
+      float dist = f16_ ? l2_f16(x, vec16_ + v * dim_, dim_) : l2_f32(x, vec32_ + v * dim_, dim_);
+      if (static_cast<int>(best.size()) < k) {
+        best.emplace_back(dist, static_cast<int64_t>(v));
+        std::push_heap(best.begin(), best.end());
+      } else if (dist < best.front().first) {
+        std::pop_heap(best.begin(), best.end());
+        best.back() = {dist, static_cast<int64_t>(v)};
+        std::push_heap(best.begin(), best.end());
       }
     }
-    float* o = out + static_cast<size_t>(r) * dim_;
-    if (best.empty()) {
-      memcpy(o, x, sizeof(float) * dim_);
-      continue;
-    }
-    double wsum = 0;
-    std::vector<double> w(best.size());
-    for (size_t i = 0; i < best.size(); ++i) {
-      double d = std::max<double>(best[i].first, 1e-12);
-      w[i] = 1.0 / (d * d);
-      wsum += w[i];
-    }
-    std::fill(acc.begin(), acc.end(), 0.f);
-    for (size_t i = 0; i < best.size(); ++i) {
-      float wi = static_cast<float>(w[i] / wsum);
-      int64_t v = best[i].second;
-      if (f16_) {
-        const uint16_t* src = vec16_ + v * dim_;
-        for (int j = 0; j < dim_; ++j) acc[j] += wi * half_to_float(src[j]);
-      } else {
-        const float* src = vec32_ + v * dim_;
-        for (int j = 0; j < dim_; ++j) acc[j] += wi * src[j];
-      }
-    }
-    memcpy(o, acc.data(), sizeof(float) * dim_);
   }
+  if (best.empty()) {
+    memcpy(o, x, sizeof(float) * dim_);
+    return;
+  }
+  double wsum = 0;
+  std::vector<double> w(best.size());
+  for (size_t i = 0; i < best.size(); ++i) {
+    double d = std::max<double>(best[i].first, 1e-12);
+    w[i] = 1.0 / (d * d);
+    wsum += w[i];
+  }
+  std::fill(acc.begin(), acc.end(), 0.f);
+  for (size_t i = 0; i < best.size(); ++i) {
+    float wi = static_cast<float>(w[i] / wsum);
+    int64_t v = best[i].second;
+    if (f16_) {
+      const uint16_t* src = vec16_ + v * dim_;
+      for (int j = 0; j < dim_; ++j) acc[j] += wi * half_to_float(src[j]);
+    } else {
+      const float* src = vec32_ + v * dim_;
+      for (int j = 0; j < dim_; ++j) acc[j] += wi * src[j];
+    }
+  }
+  memcpy(o, acc.data(), sizeof(float) * dim_);
 }
 
 }  // namespace rvc

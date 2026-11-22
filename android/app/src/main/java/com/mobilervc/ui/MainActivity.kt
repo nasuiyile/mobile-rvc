@@ -12,6 +12,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -29,6 +30,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -48,10 +51,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
+import com.mobilervc.BuildConfig
 import com.mobilervc.engine.AudioMode
 import com.mobilervc.engine.Backend
 import com.mobilervc.engine.RvcController
@@ -133,7 +139,10 @@ private fun Screen() {
         Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("RVC 实时变声 · FCPE", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("RVC 实时变声 · FCPE", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            MoreInfoMenu()
+        }
         c.installProgress?.let {
             Text("正在安装基础模型（HuBERT / FCPE）…")
             LinearProgressIndicator(progress = { it }, modifier = Modifier.fillMaxWidth())
@@ -266,15 +275,21 @@ private fun StatusPanel() {
             val block = st.optDouble("block_ms")
             val avg = st.optDouble("infer_avg_ms")
             Text("推理时间：%.0f ms / 每块 %.0f ms（实时率 %.2f）".format(avg, block, if (block > 0) avg / block else 0.0), fontWeight = FontWeight.Bold)
-            Text("算法延迟：%.0f ms，估计总延迟：%.0f ms".format(
-                st.optJSONObject("engine")?.optDouble("latency_ms") ?: 0.0, st.optDouble("latency_ms")))
+            Text("估计总延迟：%.0f ms".format(st.optDouble("latency_ms")), fontWeight = FontWeight.Bold)
+            st.optJSONObject("latency_parts")?.let {
+                Text("　= 采样 %.0f + 推理 %.0f + 输出缓冲 %.0f + 拼接 %.0f + 声卡 %.0f ms".format(
+                    it.optDouble("block"), it.optDouble("infer"), it.optDouble("queue"), it.optDouble("sola"), it.optDouble("io")),
+                    style = MaterialTheme.typography.bodySmall)
+            }
             stages?.let {
                 Text("HuBERT %.0f · FCPE %.0f · 索引 %.0f · 编码 %.0f · 流 %.0f · 声码器 %.0f ms".format(
                     it.optDouble("hubert"), it.optDouble("f0"), it.optDouble("index"), it.optDouble("enc"), it.optDouble("flow"), it.optDouble("dec")),
                     style = MaterialTheme.typography.bodySmall)
             }
-            Text("后端：${st.optJSONObject("engine")?.optJSONObject("backends") ?: "-"}", style = MaterialTheme.typography.bodySmall)
-            Text("超时块 ${st.optLong("late_blocks")} · 欠载 ${st.optLong("out_underruns")} · 丢弃 ${st.optLong("dropped_samples")} 采样",
+            Text("后端：${st.optJSONObject("engine")?.optJSONObject("backends") ?: "-"}" +
+                if (st.optBoolean("pipeline")) " · HuBERT 与声码器并行" else "", style = MaterialTheme.typography.bodySmall)
+            Text("超时块 ${st.optLong("late_blocks")} · 欠载 ${st.optLong("out_underruns")} · 丢弃 ${st.optLong("dropped_samples")} 采样" +
+                " · 停顿处回收 %.0f ms".format(st.optDouble("trimmed_ms", 0.0)),
                 style = MaterialTheme.typography.bodySmall)
             st.optJSONObject("shell")?.let { sh ->
                 Text("注入：采集 ${sh.optLong("captured")} / 注入 ${sh.optLong("injected")} 采样${sh.optString("error").let { e -> if (e.isNotEmpty()) " · $e" else "" }}",
@@ -349,6 +364,44 @@ private fun SharedFilesDialog(sh: RvcController.SharedFiles) {
         confirmButton = { TextButton(onClick = { asNewModel = true }) { Text("选择 .pth 一起导入") } },
         dismissButton = { TextButton(onClick = { c.clearShared() }) { Text("取消") } },
     )
+}
+
+private const val REPO_URL = "https://github.com/nasuiyile/mobile-rvc"
+private const val BILIBILI_URL = "https://space.bilibili.com/79356601"
+private const val RVC_URL = "https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI"
+
+/** Top-right "⋮" menu: project links and version. */
+@Composable
+private fun MoreInfoMenu() {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    var open by remember { mutableStateOf(false) }
+    fun openUrl(url: String) {
+        open = false
+        runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+            .onFailure { RvcController.message = "无法打开链接：$url" }
+    }
+    @Composable
+    fun LinkItem(title: String, subtitle: String, url: String) = DropdownMenuItem(
+        text = {
+            Column {
+                Text(title)
+                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        },
+        onClick = { openUrl(url) },
+    )
+    Box {
+        IconButton(onClick = { open = true }, modifier = Modifier.semantics { contentDescription = "更多信息" }) {
+            Text("⋮", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            LinkItem("GitHub：给个 Star", "nasuiyile/mobile-rvc", REPO_URL)
+            LinkItem("B 站：关注我", "space.bilibili.com/79356601", BILIBILI_URL)
+            LinkItem("原版 RVC 项目", "RVC-Project/Retrieval-based-Voice-Conversion-WebUI", RVC_URL)
+            HorizontalDivider()
+            DropdownMenuItem(text = { Text("版本 ${BuildConfig.VERSION_NAME}") }, onClick = {}, enabled = false)
+        }
+    }
 }
 
 @Composable
