@@ -1,5 +1,7 @@
 # Desktop tooling only (model export / reference pipeline). Python 3.10-3.12.
 torch>=2.3,<2.8
+# pulled in by torchfcpe; torchaudio>=2.9 no longer pins torch and fails to load on torch<2.8
+torchaudio>=2.3,<2.8
 transformers>=4.49,<4.50
 torchfcpe>=0.0.4,<0.1
 onnx>=1.16
