@@ -1,0 +1,8 @@
+com.mobilervc.rectest-pngs-0 /Users/qq10/mobile-rvc/android/rectest/build/generated/res/pngs/debug
+com.mobilervc.rectest-updated_navigation_xml-1 /Users/qq10/mobile-rvc/android/rectest/build/generated/updated_navigation_xml/debug
+com.mobilervc.rectest-packageDebugResources-2 /Users/qq10/mobile-rvc/android/rectest/build/intermediates/incremental/debug/packageDebugResources/merged.dir
+com.mobilervc.rectest-packageDebugResources-3 /Users/qq10/mobile-rvc/android/rectest/build/intermediates/incremental/debug/packageDebugResources/stripped.dir
+com.mobilervc.rectest-debug-4 /Users/qq10/mobile-rvc/android/rectest/build/intermediates/merged_res/debug/mergeDebugResources
+com.mobilervc.rectest-debug-5 /Users/qq10/mobile-rvc/android/rectest/src/debug/res
+com.mobilervc.rectest-main-6 /Users/qq10/mobile-rvc/android/rectest/src/main/res
+gradleHome-0 /Users/qq10/.gradle

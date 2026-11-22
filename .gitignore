@@ -1,0 +1,38 @@
+# ---- test / user voice models (never commit) --------------------------------
+*.pth
+*.index
+*.ckpt
+*.safetensors
+# local test audio
+*.wav
+*.flac
+*.mp3
+
+# ---- generated model assets (tools/build_assets.sh) -------------------------
+/build/
+
+# ---- Android / Gradle -------------------------------------------------------
+.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+android/.kotlin/
+*.apk
+*.aab
+*.keystore
+*.jks
+captures/
+
+# ---- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ---- IDE / OS ---------------------------------------------------------------
+.idea/
+*.iml
+.vscode/
+.DS_Store
