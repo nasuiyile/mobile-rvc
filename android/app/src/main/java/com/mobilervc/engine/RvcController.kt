@@ -282,6 +282,7 @@ object RvcController {
                 .put("app_uid", android.os.Process.myUid())
                 .put("a11y_component", a11y)
                 .put("max_backlog_ms", (s.blockTime * 2000).toInt() + 100)
+                .put("comfort_noise_db", if (s.comfortNoise) s.comfortNoiseDb.toDouble() else 0.0)
             // the driver must be running before the shell may ask for local capture
             opts.put("local_input", false).put("local_output", s.monitor).put("input_exclusive", false)
                 .put("virtual_capture", true)

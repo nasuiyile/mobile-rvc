@@ -57,6 +57,7 @@ class ShellAudioService() : IShellAudio.Stub() {
     }
 
     @Volatile private var running = false
+    private val session = java.util.concurrent.atomic.AtomicInteger()  // bumped by every start and stop
     private var track: AudioTrack? = null
     private var policy: Any? = null
     private var injectThread: Thread? = null
@@ -78,6 +79,7 @@ class ShellAudioService() : IShellAudio.Stub() {
     private var intercept = setOf(1, 5, 6, 7, 9)
     private var appUid = -1
     private var a11yComponent = ""
+    private var comfortNoiseDb = 0.0  // dBFS RMS of the injected noise floor; >= 0: none
 
     // monitor state
     private val monitorWake = Object()
@@ -124,6 +126,12 @@ class ShellAudioService() : IShellAudio.Stub() {
                               cb: IShellCallback?): String =
         try {
             stopInternal()
+            // a start begins with a clean slate: an error left by the previous session (e.g. its
+            // threads noticing the pipes go away) must not be reported as a failure of this one
+            lastError = null
+            captured = 0
+            injected = 0
+            dropped = 0
             ShellEnv.init()
             val cfg = JSONObject(configJson ?: "{}")
             sampleRate = cfg.optInt("sample_rate", 48000)
@@ -131,6 +139,7 @@ class ShellAudioService() : IShellAudio.Stub() {
             intercept = cfg.optJSONArray("intercept")?.let { a -> (0 until a.length()).map { a.getInt(it) }.toSet() } ?: intercept
             appUid = cfg.optInt("app_uid", -1)
             a11yComponent = cfg.optString("a11y_component")
+            comfortNoiseDb = cfg.optDouble("comfort_noise_db", 0.0)
             val maxBacklog = cfg.optInt("max_backlog_ms", 800) * sampleRate / 1000
             captureFd = captureOut
             playbackFd = playbackIn
@@ -378,6 +387,50 @@ class ShellAudioService() : IShellAudio.Stub() {
     }
 
     // ---------------------------------------------------------------- injection
+    /**
+     * A real microphone never delivers digital silence. Apps know that: a run of all-zero
+     * samples means "the microphone is blocked / taken by another app" to them, and many abort
+     * the recording on the spot. Our stream is exactly zero while the first block of a
+     * recording is still being converted, and for as long as the user says nothing whenever the
+     * response threshold or the noise reduction is on (they scale the output down to nothing).
+     * So everything the injection track plays gets the noise floor of a quiet room: pink-ish
+     * noise at [levelDb] dBFS RMS (-60 dB is about 33 steps of the 16-bit scale).
+     */
+    private class ComfortNoise(levelDb: Double) {
+        private var seed = 0x2F6E2B1
+        private var b0 = 0f
+        private var b1 = 0f
+        private var b2 = 0f
+        private var gain = 1f
+
+        init {
+            var sum = 0.0
+            val n = 48000
+            repeat(n) { val v = raw(); sum += v * v }
+            gain = (Math.pow(10.0, levelDb / 20.0) / Math.sqrt(sum / n)).toFloat()
+        }
+
+        // xorshift white noise through Paul Kellet's economy pink filter
+        private fun raw(): Float {
+            var x = seed
+            x = x xor (x shl 13)
+            x = x xor (x ushr 17)
+            x = x xor (x shl 5)
+            seed = x
+            val white = x * (1f / 2147483648f)
+            b0 = 0.99765f * b0 + white * 0.0990460f
+            b1 = 0.96300f * b1 + white * 0.2965164f
+            b2 = 0.57000f * b2 + white * 1.0526913f
+            return b0 + b1 + b2 + white * 0.1848f
+        }
+
+        fun next(): Float = raw() * gain
+
+        fun fill(dst: ShortArray) {
+            for (i in dst.indices) dst[i] = (next() * 32767f).roundToInt().toShort()
+        }
+    }
+
     private fun captureAttr(preset: Int): AudioAttributes {
         val b = AudioAttributes.Builder()
         AudioAttributes.Builder::class.java.getMethod("setCapturePreset", Int::class.javaPrimitiveType).invoke(b, preset)
@@ -415,6 +468,8 @@ class ShellAudioService() : IShellAudio.Stub() {
             ?: throw IllegalStateException("createAudioTrackSource returned null")
         track = t
         t.play()
+        val mySession = session.incrementAndGet()
+        fun alive() = running && session.get() == mySession
         injectThread = Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             val frames = sr / 100
@@ -424,9 +479,22 @@ class ShellAudioService() : IShellAudio.Stub() {
             val pcm = ShortArray(frames * 2)
             val fis = java.io.FileInputStream(input)
             val silence = ShortArray(sr / 200)  // 5 ms
+            val noise = if (comfortNoiseDb < 0) ComfortNoise(comfortNoiseDb) else null
             var written = 0L  // frames written to the track (silence + audio)
             val pfd = arrayOf(android.system.StructPollfd().apply { fd = input; events = OsConstants.POLLIN.toShort() })
-            while (running) {
+            // A streaming AudioTrack only starts running once its buffer has been filled for the
+            // first time. The 5 ms top-ups below never get there: they stop as soon as 10 ms are
+            // queued, and nothing is consumed before the track runs. Left like that, the track
+            // would stay idle until the first converted block arrived, the injection input would
+            // count as unavailable, and the first recording after starting would be routed to the
+            // real microphone for its first half second.
+            runCatching {
+                val prime = ShortArray(maxOf(t.bufferSizeInFrames, sr * 3 / 20))
+                noise?.fill(prime)
+                t.write(prime, 0, prime.size, AudioTrack.WRITE_BLOCKING)
+                written = prime.size.toLong()
+            }
+            while (alive()) {
                 try {
                     // keep latency bounded if we fall behind
                     val backlog = fis.available() / 4
@@ -453,7 +521,9 @@ class ShellAudioService() : IShellAudio.Stub() {
                         resetTrack = false
                         runCatching { t.pause(); t.flush(); t.play() }
                         written = (t.playbackHeadPosition.toLong() and 0xFFFFFFFFL)
-                        val flushSilence = ShortArray(sr * 3 / 20)
+                        // at least a full buffer, or the track would not start running again
+                        val flushSilence = ShortArray(maxOf(t.bufferSizeInFrames, sr * 3 / 20))
+                        noise?.fill(flushSilence)  // what the next recording reads first
                         t.write(flushSilence, 0, flushSilence.size, AudioTrack.WRITE_BLOCKING)
                         written += flushSilence.size
                     }
@@ -463,6 +533,7 @@ class ShellAudioService() : IShellAudio.Stub() {
                         // 32-bit modular difference (the head position wraps after ~24 h at 48 kHz)
                         val queued = ((written and 0xFFFFFFFFL) - (t.playbackHeadPosition.toLong() and 0xFFFFFFFFL)) and 0xFFFFFFFFL
                         if (queued < sr / 100) {
+                            noise?.fill(silence)
                             t.write(silence, 0, silence.size, AudioTrack.WRITE_BLOCKING)
                             written += silence.size
                         }
@@ -481,15 +552,23 @@ class ShellAudioService() : IShellAudio.Stub() {
                     val samples = buf.position() / 4
                     buf.flip()
                     val fb = buf.asFloatBuffer()
-                    for (i in 0 until samples) pcm[i] = (fb.get(i).coerceIn(-1f, 1f) * 32767f).roundToInt().toShort()
+                    if (noise != null) {
+                        for (i in 0 until samples) pcm[i] = ((fb.get(i) + noise.next()).coerceIn(-1f, 1f) * 32767f).roundToInt().toShort()
+                    } else {
+                        for (i in 0 until samples) pcm[i] = (fb.get(i).coerceIn(-1f, 1f) * 32767f).roundToInt().toShort()
+                    }
                     t.write(pcm, 0, samples, AudioTrack.WRITE_BLOCKING)
                     written += samples
                     injected += samples
                 } catch (e: ErrnoException) {
                     if (e.errno != OsConstants.EINTR) {
-                        lastError = "playback pipe: ${e.message}"
+                        // stop() closes the pipe under us: that is the end of the session, not a fault
+                        if (alive()) lastError = "playback pipe: ${e.message}"
                         break
                     }
+                } catch (e: java.io.IOException) {
+                    if (alive()) lastError = "playback pipe: ${e.message}"
+                    break
                 }
             }
         }, "rvc-inject").apply { start() }
@@ -500,11 +579,15 @@ class ShellAudioService() : IShellAudio.Stub() {
 
     private fun stopInternal() {
         running = false
+        session.incrementAndGet()
         synchronized(monitorWake) { monitorWake.notifyAll() }
         monitorThread?.join(500)
         monitorThread = null
         stopCapture(release = true)
         mode = MODE_NONE
+        // the injection thread polls every 2 ms: give it the chance to leave on its own before
+        // the pipe it reads is closed
+        injectThread?.join(200)
         runCatching { playbackFd?.close() }
         runCatching { captureFd?.close() }
         injectThread?.join(500)
@@ -534,6 +617,7 @@ class ShellAudioService() : IShellAudio.Stub() {
         .put("captured", captured)
         .put("injected", injected)
         .put("dropped", dropped)
+        .put("comfort_noise_db", comfortNoiseDb)
         .put("sdk", Build.VERSION.SDK_INT)
         .apply { lastError?.let { put("error", it) } }
         .toString()

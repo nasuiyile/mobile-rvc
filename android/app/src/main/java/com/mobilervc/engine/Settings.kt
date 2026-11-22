@@ -5,14 +5,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /** Compute backend choices exposed in the UI (native names understood by the engine). */
-enum class Backend(val id: String, val label: String) {
-    CPU("cpu", "CPU (ONNX Runtime)"),
-    NATIVE("native", "CPU 原生 NEON"),
-    XNNPACK("xnnpack", "CPU XNNPACK"),
-    GPU("webgpu", "GPU (WebGPU/Vulkan)"),
-    NNAPI("nnapi", "NNAPI (GPU/NPU)"),
-    QNN_HTP("qnn_htp", "NPU 骁龙 HTP (QNN)"),
-    QNN_GPU("qnn_gpu", "GPU 骁龙 Adreno (QNN)");
+enum class Backend(val id: String, val label: String, val short: String) {
+    CPU("cpu", "CPU (ONNX Runtime)", "CPU"),
+    NATIVE("native", "CPU 原生 NEON", "NEON"),
+    XNNPACK("xnnpack", "CPU XNNPACK", "XNNPACK"),
+    GPU("webgpu", "GPU (WebGPU/Vulkan)", "GPU"),
+    NNAPI("nnapi", "NNAPI (GPU/NPU)", "NNAPI"),
+    QNN_HTP("qnn_htp", "NPU 骁龙 HTP (QNN)", "NPU"),
+    QNN_GPU("qnn_gpu", "GPU 骁龙 Adreno (QNN)", "GPU");
 
     companion object {
         fun of(id: String) = entries.firstOrNull { it.id == id } ?: CPU
@@ -50,6 +50,9 @@ data class Settings(
     val monitor: Boolean = true,   // play converted voice locally
     val outputGain: Float = 1f,
     val passthrough: Boolean = false, // RVC "输入监听"
+    // virtual mic: a faint noise floor instead of digital silence (apps abort "dead" recordings)
+    val comfortNoise: Boolean = true,
+    val comfortNoiseDb: Float = -60f, // dBFS RMS
 ) {
     fun engineConfig(ctx: Context, device: JSONObject?): JSONObject {
         val big = device?.optJSONArray("big_cores") ?: JSONArray()
@@ -99,6 +102,8 @@ data class Settings(
                 monitor = p.getBoolean("monitor", d.monitor),
                 outputGain = p.getFloat("outputGain", d.outputGain),
                 passthrough = p.getBoolean("passthrough", d.passthrough),
+                comfortNoise = p.getBoolean("comfortNoise", d.comfortNoise),
+                comfortNoiseDb = p.getFloat("comfortNoiseDb", d.comfortNoiseDb),
             )
         }
 
@@ -115,6 +120,7 @@ data class Settings(
                 .putInt("sid", s.sid).putString("mode", s.mode.name)
                 .putBoolean("monitor", s.monitor).putFloat("outputGain", s.outputGain)
                 .putBoolean("passthrough", s.passthrough)
+                .putBoolean("comfortNoise", s.comfortNoise).putFloat("comfortNoiseDb", s.comfortNoiseDb)
                 .apply()
         }
     }

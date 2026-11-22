@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">RVC 实时变声</string>
+    <string name="app_name">rvc手机版</string>
     <string name="channel_name">实时变声</string>
     <string name="notif_title">RVC 实时变声运行中</string>
     <string name="notif_text">点击返回应用调整参数</string>
     <string name="stop">停止</string>
-    <string name="import_target">导入到 RVC 实时变声</string>
+    <string name="import_target">导入到 rvc手机版</string>
     <string name="a11y_label">RVC 虚拟麦克风</string>
     <string name="a11y_description">让变声采集与微信、QQ 等应用的录音同时进行（不读取屏幕内容，不执行任何操作）。</string>
 </resources>

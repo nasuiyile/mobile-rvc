@@ -22,8 +22,8 @@ android {
         applicationId = "com.mobilervc"
         minSdk = 29          // AAudio input presets (VOICE_PERFORMANCE), AudioPolicy injection
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.1.4"
+        versionCode = 6
+        versionName = "0.1.5"
         ndk { abiFilters += listOf("arm64-v8a") }
         externalNativeBuild {
             cmake {

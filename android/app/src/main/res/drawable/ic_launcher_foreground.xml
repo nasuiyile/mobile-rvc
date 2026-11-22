@@ -1,7 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Square-faced white cat with dot eyes and an open (talking) mouth, next to a stand microphone. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
-    <group android:translateX="30" android:translateY="30" android:scaleX="2" android:scaleY="2">
-        <path android:fillColor="#FFFFFFFF"
-            android:pathData="M12,14c1.66,0 3,-1.34 3,-3V5c0,-1.66 -1.34,-3 -3,-3S9,3.34 9,5v6c0,1.66 1.34,3 3,3zM17,11c0,2.76 -2.24,5 -5,5s-5,-2.24 -5,-5H5c0,3.53 2.61,6.43 6,6.92V21h2v-3.08c3.39,-0.49 6,-3.39 6,-6.92h-2z" />
-    </group>
+    <!-- ears -->
+    <path android:fillColor="#FFFFFFFF" android:strokeColor="#FFFFFFFF" android:strokeWidth="4"
+        android:strokeLineJoin="round" android:strokeLineCap="round"
+        android:pathData="M27,50 L28,33 L40,47 Z M59,50 L58,33 L46,47 Z" />
+    <!-- head -->
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M30,46 H56 A8,8 0 0 1 64,54 V70 A8,8 0 0 1 56,78 H30 A8,8 0 0 1 22,70 V54 A8,8 0 0 1 30,46 Z" />
+    <!-- eyes -->
+    <path android:fillColor="#FFFF7A1A"
+        android:pathData="M32.5,61 a3.5,3.5 0 1 0 7,0 a3.5,3.5 0 1 0 -7,0 Z M46.5,61 a3.5,3.5 0 1 0 7,0 a3.5,3.5 0 1 0 -7,0 Z" />
+    <!-- open mouth -->
+    <path android:fillColor="#FFFF7A1A" android:strokeColor="#FFFF7A1A" android:strokeWidth="1.5"
+        android:strokeLineJoin="round"
+        android:pathData="M40,67 H46 Q46,72 43,72 Q40,72 40,67 Z" />
+    <!-- microphone: capsule, holder, stand -->
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M70,55 a5,5 0 0 1 10,0 v7 a5,5 0 0 1 -10,0 Z" />
+    <path android:strokeColor="#FFFFFFFF" android:strokeWidth="3" android:strokeLineCap="round"
+        android:pathData="M66,60 a9,9 0 0 0 18,0 M75,69 V76 M70,76 H80" />
 </vector>

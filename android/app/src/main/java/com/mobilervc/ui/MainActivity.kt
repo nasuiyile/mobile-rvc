@@ -1,6 +1,7 @@
 package com.mobilervc.ui
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -11,50 +12,93 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalMinimumInteractiveComponentSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Slider
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.setProgress
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
 import com.mobilervc.BuildConfig
@@ -72,12 +116,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         RvcController.init(this)
         ShizukuBridge.init()
-        setContent {
-            val dark = isSystemInDarkTheme()
-            MaterialTheme(colorScheme = if (dark) darkColorScheme() else lightColorScheme()) {
-                Surface(Modifier.fillMaxSize()) { Screen() }
-            }
-        }
+        setContent { AppTheme { Screen() } }
         if (savedInstanceState == null) handleShare(intent)
     }
 
@@ -109,11 +148,31 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/** System colours on Android 12+, and controls a little tighter than the 48 dp default. */
+@Composable
+private fun AppTheme(content: @Composable () -> Unit) {
+    val ctx = LocalContext.current
+    val dark = isSystemInDarkTheme()
+    val colors = when {
+        Build.VERSION.SDK_INT >= 31 -> if (dark) dynamicDarkColorScheme(ctx) else dynamicLightColorScheme(ctx)
+        dark -> darkColorScheme()
+        else -> lightColorScheme()
+    }
+    MaterialTheme(colorScheme = colors) {
+        CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides 40.dp, content = content)
+    }
+}
+
+/**
+ * Fixed top bar (title, progress of whatever is busy), scrolling settings in collapsible
+ * sections, fixed bottom bar (start / stop and the live status): what is happening and the main
+ * action stay on screen wherever the settings are scrolled to.
+ */
 @Composable
 private fun Screen() {
     val c = RvcController
     val s = c.settings
-    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val ctx = LocalContext.current
     val micPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
     LaunchedEffect(Unit) {
         val need = mutableListOf(Manifest.permission.RECORD_AUDIO)
@@ -130,129 +189,30 @@ private fun Screen() {
     val basePack = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { u -> c.importBasePack { ctx.contentResolver.openInputStream(u)!! } }
     }
-    val indexPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        val m = c.models.firstOrNull { it.id == s.modelId }
-        if (uri != null && m != null) c.attachIndex(m, uri)
-    }
 
-    Column(
-        Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("RVC 实时变声 · FCPE", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            MoreInfoMenu()
-        }
-        c.installProgress?.let {
-            Text("正在安装基础模型（HuBERT / FCPE）…")
-            LinearProgressIndicator(progress = { it }, modifier = Modifier.fillMaxWidth())
-        }
-        if (!c.assetsReady && c.installProgress == null) {
-            Card { Column(Modifier.padding(12.dp)) {
-                Text("缺少基础模型。请用 tools/build_assets.sh 生成后重新打包 APK，或导入基础模型包 (.zip)。")
-                OutlinedButton(onClick = { basePack.launch(arrayOf("application/zip", "*/*")) }) { Text("导入基础模型包") }
-            } }
-        }
-        c.busy?.let { Row(verticalAlignment = Alignment.CenterVertically) { LinearProgressIndicator(Modifier.width(80.dp)); Spacer(Modifier.width(8.dp)); Text(it) } }
-
-        Section("加载模型") {
-            val models = c.models
-            val current = models.firstOrNull { it.id == s.modelId }
-            Dropdown(
-                label = current?.let { "${it.name}  (${it.version}, ${it.sampleRate / 1000}k${if (it.hasIndex) ", 索引" else ""})" } ?: "未选择模型",
-                items = models.map { it.id to "${it.name} (${it.version}, ${it.sampleRate / 1000}k)" },
-                onSelect = { id -> c.update { st -> st.copy(modelId = id) } },
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { showImport = true }, enabled = c.assetsReady && c.busy == null) { Text("导入 .pth") }
-                OutlinedButton(onClick = { indexPicker.launch(arrayOf("*/*")) }, enabled = current != null && c.busy == null) {
-                    Text(if (current?.hasIndex == true) "更换 .index" else "添加 .index")
+    Scaffold(
+        topBar = { TopBar() },
+        bottomBar = { BottomBar() },
+        containerColor = MaterialTheme.colorScheme.surface,
+    ) { pad ->
+        Column(
+            Modifier.fillMaxSize().padding(pad).verticalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (!c.assetsReady && c.installProgress == null) {
+                Panel {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("缺少基础模型", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                        Caption("用 tools/build_assets.sh 生成后重新打包 APK，或导入基础模型包 (.zip)。")
+                        SmallButton("导入基础模型包", filled = true) { basePack.launch(arrayOf("application/zip", "*/*")) }
+                    }
                 }
-                if (current != null) TextButton(onClick = { c.deleteModel(current) }, enabled = !c.running) { Text("删除") }
             }
+            ModelSection(onImport = { showImport = true })
+            VoiceSection()
+            AudioSection()
+            PerformanceSection()
         }
-
-        Section("常规设置") {
-            LabeledSlider("响应阈值 (dB)", s.threshold, -60f..0f, 59, "%.0f") { v -> c.update { it.copy(threshold = v) } }
-            LabeledSlider("音调设置", s.pitch, -16f..16f, 31, "%+.0f") { v -> c.update { it.copy(pitch = v) } }
-            LabeledSlider("性别因子/声线粗细", s.formant, -2f..2f, 79, "%+.2f") { v -> c.update { it.copy(formant = v) } }
-            LabeledSlider("Index Rate", s.indexRate, 0f..1f, 99, "%.2f") { v -> c.update { it.copy(indexRate = v) } }
-            LabeledSlider("响度因子", s.rmsMixRate, 0f..1f, 99, "%.2f") { v -> c.update { it.copy(rmsMixRate = v) } }
-            Text("音高算法：FCPE", style = MaterialTheme.typography.bodySmall)
-        }
-
-        Section("性能设置（修改后重新开始生效）") {
-            LabeledSlider("采样长度 (s)", s.blockTime, 0.1f..1.0f, 89, "%.2f") { v -> c.update { it.copy(blockTime = (v * 100).roundToInt() / 100f) } }
-            LabeledSlider("淡入淡出长度 (s)", s.crossfadeTime, 0.01f..0.15f, 13, "%.2f") { v -> c.update { it.copy(crossfadeTime = (v * 100).roundToInt() / 100f) } }
-            LabeledSlider("额外推理时长 (s)", s.extraTime, 0.05f..3.0f, 58, "%.2f") { v -> c.update { it.copy(extraTime = (v * 100).roundToInt() / 100f) } }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(s.inputNoiseReduce, { c.update { it.copy(inputNoiseReduce = !it.inputNoiseReduce) } }, label = { Text("输入降噪") })
-                FilterChip(s.outputNoiseReduce, { c.update { it.copy(outputNoiseReduce = !it.outputNoiseReduce) } }, label = { Text("输出降噪") })
-            }
-            val providers = c.device?.optJSONArray("providers")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList()
-            fun avail(b: Backend) = when (b) {
-                Backend.CPU, Backend.NATIVE -> true
-                Backend.XNNPACK -> "XnnpackExecutionProvider" in providers
-                Backend.GPU -> "WebGpuExecutionProvider" in providers
-                Backend.NNAPI -> "NnapiExecutionProvider" in providers
-                Backend.QNN_HTP, Backend.QNN_GPU -> "QNNExecutionProvider" in providers
-            }
-            Text("HuBERT 特征提取后端", style = MaterialTheme.typography.labelLarge)
-            Dropdown(Backend.of(s.hubertBackend).label,
-                Backend.entries.filter { it != Backend.NATIVE && avail(it) }.map { it.id to it.label }) { id -> c.update { it.copy(hubertBackend = id) } }
-            Text("声码器 (NSF-HiFiGAN) 后端", style = MaterialTheme.typography.labelLarge)
-            Dropdown(Backend.of(s.decBackend).label, Backend.entries.filter { avail(it) }.map { it.id to it.label }) { id -> c.update { it.copy(decBackend = id) } }
-            SwitchRow("FP16 半精度（原生 NEON / GPU / NPU）", s.fp16) { v -> c.update { it.copy(fp16 = v) } }
-            val big = c.device?.optJSONArray("big_cores")?.length() ?: 4
-            LabeledSlider("CPU 线程（0=自动, 大核 $big 个）", s.threads.toFloat(), 0f..8f, 7, "%.0f") { v -> c.update { it.copy(threads = v.roundToInt()) } }
-            SwitchRow("NSF 相位跨块连续（实验）", s.phaseLock) { v -> c.update { it.copy(phaseLock = v) } }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedButton(onClick = { c.bench() }, enabled = !c.running && c.busy == null && s.modelId.isNotEmpty()) { Text("性能测试") }
-            }
-            c.benchResult?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-        }
-
-        Section("音频") {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(s.mode == AudioMode.LOCAL, { c.update { it.copy(mode = AudioMode.LOCAL) } }, label = { Text("本地监听") })
-                FilterChip(s.mode == AudioMode.VIRTUAL_MIC, { c.update { it.copy(mode = AudioMode.VIRTUAL_MIC) } }, label = { Text("虚拟麦克风 (Shizuku)") })
-            }
-            if (s.mode == AudioMode.VIRTUAL_MIC) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Shizuku：${ShizukuBridge.stateText}", Modifier.weight(1f))
-                    if (ShizukuBridge.state == ShizukuBridge.State.NO_PERMISSION) TextButton(onClick = { ShizukuBridge.requestPermission() }) { Text("授权") }
-                }
-                if (c.running) {
-                    Text(
-                        when (c.captureMode) {
-                            1 -> "● 正在变声（语音消息模式）"
-                            2 -> "● 正在变声（通话模式）"
-                            else -> "○ 待命：其他应用开始录音时自动变声，平时不占用麦克风"
-                        },
-                        color = if (c.captureMode != 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                SwitchRow("同时本地监听", s.monitor) { v -> c.update { it.copy(monitor = v) } }
-                Text(
-                    "微信、QQ 等应用录音时会自动收到变声后的声音，开头约 0.4–0.6 秒为静音（不会漏出本音）；" +
-                        "「采样长度」越小，唤醒越快、但 CPU 负担越大。" +
-                        "首次使用会通过 Shizuku 自动开启「RVC 虚拟麦克风」无障碍服务，它只用于让变声采集和语音消息同时进行，不读取屏幕内容。",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-            LabeledSlider("输出增益", s.outputGain, 0f..3f, 29, "%.1f") { v -> c.update { it.copy(outputGain = v) } }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(!s.passthrough, { c.update { it.copy(passthrough = false) } }, label = { Text("输出变声") })
-                FilterChip(s.passthrough, { c.update { it.copy(passthrough = true) } }, label = { Text("输入监听") })
-            }
-        }
-
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(onClick = { VoiceService.start(ctx) }, enabled = !c.running && c.busy == null && c.assetsReady) { Text("开始音频转换") }
-            OutlinedButton(onClick = { VoiceService.stop(ctx) }, enabled = c.running) { Text("停止音频转换") }
-        }
-        StatusPanel()
-        Spacer(Modifier.height(24.dp))
     }
 
     if (showImport) ImportDialog(onDismiss = { showImport = false }) { pth, idx ->
@@ -265,38 +225,262 @@ private fun Screen() {
     }
 }
 
+// ---------------------------------------------------------------------------- fixed bars
 @Composable
-private fun StatusPanel() {
-    val st = RvcController.status ?: return
-    if (!st.optBoolean("running")) return
-    val stages = st.optJSONObject("stages")
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            val block = st.optDouble("block_ms")
-            val avg = st.optDouble("infer_avg_ms")
-            Text("推理时间：%.0f ms / 每块 %.0f ms（实时率 %.2f）".format(avg, block, if (block > 0) avg / block else 0.0), fontWeight = FontWeight.Bold)
-            Text("估计总延迟：%.0f ms".format(st.optDouble("latency_ms")), fontWeight = FontWeight.Bold)
-            st.optJSONObject("latency_parts")?.let {
-                Text("　= 采样 %.0f + 推理 %.0f + 输出缓冲 %.0f + 拼接 %.0f + 声卡 %.0f ms".format(
-                    it.optDouble("block"), it.optDouble("infer"), it.optDouble("queue"), it.optDouble("sola"), it.optDouble("io")),
-                    style = MaterialTheme.typography.bodySmall)
+private fun TopBar() {
+    val c = RvcController
+    Surface(color = MaterialTheme.colorScheme.surface) {
+        Column(Modifier.windowInsetsPadding(WindowInsets.statusBars)) {
+            Row(Modifier.fillMaxWidth().height(48.dp).padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("RVC 实时变声", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(8.dp))
+                Tag("FCPE")
+                Spacer(Modifier.weight(1f))
+                MoreInfoMenu()
             }
-            stages?.let {
-                Text("HuBERT %.0f · FCPE %.0f · 索引 %.0f · 编码 %.0f · 流 %.0f · 声码器 %.0f ms".format(
-                    it.optDouble("hubert"), it.optDouble("f0"), it.optDouble("index"), it.optDouble("enc"), it.optDouble("flow"), it.optDouble("dec")),
-                    style = MaterialTheme.typography.bodySmall)
+            // whatever is in progress (asset install, import, model load, warm-up, benchmark)
+            val install = c.installProgress
+            val busy = c.busy ?: install?.let { "正在安装基础模型（HuBERT / FCPE）…" }
+            var shown by remember { mutableStateOf("") }
+            if (busy != null) shown = busy
+            AnimatedVisibility(busy != null) {
+                Column {
+                    Text(shown, Modifier.padding(start = 16.dp, end = 16.dp, bottom = 6.dp), style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    if (install != null) LinearProgressIndicator(progress = { install }, modifier = Modifier.fillMaxWidth().height(3.dp))
+                    else LinearProgressIndicator(Modifier.fillMaxWidth().height(3.dp))
+                }
             }
-            Text("后端：${st.optJSONObject("engine")?.optJSONObject("backends") ?: "-"}" +
-                if (st.optBoolean("pipeline")) " · HuBERT 与声码器并行" else "", style = MaterialTheme.typography.bodySmall)
-            Text("超时块 ${st.optLong("late_blocks")} · 欠载 ${st.optLong("out_underruns")} · 丢弃 ${st.optLong("dropped_samples")} 采样" +
-                " · 停顿处回收 %.0f ms".format(st.optDouble("trimmed_ms", 0.0)),
-                style = MaterialTheme.typography.bodySmall)
-            st.optJSONObject("shell")?.let { sh ->
-                Text("注入：采集 ${sh.optLong("captured")} / 注入 ${sh.optLong("injected")} 采样${sh.optString("error").let { e -> if (e.isNotEmpty()) " · $e" else "" }}",
-                    style = MaterialTheme.typography.bodySmall)
-            }
-            st.optString("error").takeIf { it.isNotEmpty() }?.let { Text("错误：$it", color = MaterialTheme.colorScheme.error) }
+            if (busy == null) HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
         }
+    }
+}
+
+@Composable
+private fun BottomBar() {
+    val c = RvcController
+    val ctx = LocalContext.current
+    Surface(color = MaterialTheme.colorScheme.surfaceContainer, shadowElevation = 8.dp) {
+        Column(
+            Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.navigationBars).padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            if (c.running) StatusStrip()
+            val busy = c.busy
+            if (c.running) {
+                FilledTonalButton(
+                    onClick = { VoiceService.stop(ctx) }, modifier = Modifier.fillMaxWidth().height(46.dp),
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer, contentColor = MaterialTheme.colorScheme.onErrorContainer),
+                ) { Text("停止音频转换", fontWeight = FontWeight.SemiBold) }
+            } else {
+                Button(
+                    onClick = { VoiceService.start(ctx) }, modifier = Modifier.fillMaxWidth().height(46.dp),
+                    enabled = busy == null && c.assetsReady && c.installProgress == null,
+                ) {
+                    if (busy != null) {
+                        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                        Text(busy, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    } else {
+                        Text("开始音频转换", fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Live status above the stop button: one line, tap for the details. */
+@Composable
+private fun StatusStrip() {
+    val c = RvcController
+    val st = c.status?.takeIf { it.optBoolean("running") }
+    val prefs = LocalContext.current.getSharedPreferences("ui", Context.MODE_PRIVATE)
+    var details by remember { mutableStateOf(prefs.getBoolean("open_status", false)) }
+    val virtual = c.settings.mode == AudioMode.VIRTUAL_MIC
+    val active = !virtual || c.captureMode != 0
+    val small = MaterialTheme.typography.bodySmall
+    val dim = MaterialTheme.colorScheme.onSurfaceVariant
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable {
+            details = !details
+            prefs.edit().putBoolean("open_status", details).apply()
+        }.padding(horizontal = 4.dp, vertical = 2.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(8.dp).clip(CircleShape).background(if (active) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline))
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                if (st == null) {
+                    Text("正在启动…", style = MaterialTheme.typography.bodyMedium)
+                } else if (!active) {
+                    Text("待命：其他应用开始录音时自动变声", style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    val block = st.optDouble("block_ms")
+                    val avg = st.optDouble("infer_avg_ms")
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        Text("延迟 ", style = small, color = dim)
+                        Text("%.0f ms".format(st.optDouble("latency_ms")), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Text("　推理 %.0f / %.0f ms · 实时率 %.2f".format(avg, block, if (block > 0) avg / block else 0.0),
+                            style = small, color = dim, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                if (virtual && c.captureMode != 0) {
+                    Text(if (c.captureMode == 1) "正在变声（语音消息模式）" else "正在变声（通话模式）", style = small, color = MaterialTheme.colorScheme.primary)
+                }
+            }
+            Chevron(!details)  // the details open upwards
+        }
+        st?.optString("error")?.takeIf { it.isNotEmpty() }?.let { Text("错误：$it", style = small, color = MaterialTheme.colorScheme.error) }
+        AnimatedVisibility(details && st != null) {
+            Column(Modifier.padding(start = 16.dp, top = 4.dp), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                st?.optJSONObject("latency_parts")?.let {
+                    Text("采样 %.0f + 推理 %.0f + 缓冲 %.0f + 拼接 %.0f + 声卡 %.0f ms".format(
+                        it.optDouble("block"), it.optDouble("infer"), it.optDouble("queue"), it.optDouble("sola"), it.optDouble("io")), style = small)
+                }
+                st?.optJSONObject("stages")?.let {
+                    Text("HuBERT %.0f · FCPE %.0f · 索引 %.0f · 编码 %.0f · 流 %.0f · 声码器 %.0f ms".format(
+                        it.optDouble("hubert"), it.optDouble("f0"), it.optDouble("index"), it.optDouble("enc"), it.optDouble("flow"), it.optDouble("dec")),
+                        style = small, color = dim)
+                }
+                Text("后端 ${backendSummary(st?.optJSONObject("engine")?.optJSONObject("backends"))}" +
+                    if (st?.optBoolean("pipeline") == true) " · 两段并行" else "", style = small, color = dim)
+                Text("超时块 ${st?.optLong("late_blocks")} · 欠载 ${st?.optLong("out_underruns")} · 丢弃 ${st?.optLong("dropped_samples")} 采样" +
+                    " · 停顿处回收 %.0f ms".format(st?.optDouble("trimmed_ms", 0.0) ?: 0.0), style = small, color = dim)
+                st?.optJSONObject("shell")?.let { sh ->
+                    Text("注入：采集 ${sh.optLong("captured")} / 注入 ${sh.optLong("injected")} 采样${sh.optString("error").let { e -> if (e.isNotEmpty()) " · $e" else "" }}",
+                        style = small, color = dim)
+                }
+            }
+        }
+    }
+}
+
+/** {"hubert":"cpu","dec":"native_fp16",...} -> "HuBERT cpu · 声码器 native_fp16" */
+private fun backendSummary(be: org.json.JSONObject?): String =
+    if (be == null) "-" else "HuBERT ${be.optString("hubert", "-")} · 声码器 ${be.optString("dec", "-")}"
+
+// ---------------------------------------------------------------------------- sections
+@Composable
+private fun ModelSection(onImport: () -> Unit) {
+    val c = RvcController
+    val s = c.settings
+    val models = c.models
+    val current = models.firstOrNull { it.id == s.modelId }
+    val indexPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val m = c.models.firstOrNull { it.id == c.settings.modelId }
+        if (uri != null && m != null) c.attachIndex(m, uri)
+    }
+    Section("model", "模型", summary = current?.name ?: "未选择") {
+        SelectField(
+            text = current?.let { "${it.name}（${it.version}，${it.sampleRate / 1000}k${if (it.hasIndex) "，含索引" else ""}）" } ?: "未选择模型",
+            items = models.map { it.id to "${it.name}（${it.version}，${it.sampleRate / 1000}k${if (it.hasIndex) "，含索引" else ""}）" },
+            placeholder = "还没有模型，请先导入 .pth",
+        ) { id -> c.update { st -> st.copy(modelId = id) } }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            SmallButton("导入 .pth", filled = true, enabled = c.assetsReady && c.busy == null, onClick = onImport)
+            SmallButton(if (current?.hasIndex == true) "更换 .index" else "添加 .index", enabled = current != null && c.busy == null) {
+                indexPicker.launch(arrayOf("*/*"))
+            }
+            Spacer(Modifier.weight(1f))
+            if (current != null) {
+                TextButton(onClick = { c.deleteModel(current) }, enabled = !c.running,
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("删除") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun VoiceSection() {
+    val c = RvcController
+    val s = c.settings
+    Section("voice", "变声参数", summary = "音调 %+.0f · 索引 %.2f".format(s.pitch, s.indexRate)) {
+        ParamSlider("音调", s.pitch, -16f..16f, 31, "%+.0f".format(s.pitch)) { v -> c.update { it.copy(pitch = v) } }
+        ParamSlider("性别因子", s.formant, -2f..2f, 79, "%+.2f".format(s.formant)) { v -> c.update { it.copy(formant = v) } }
+        ParamSlider("Index Rate", s.indexRate, 0f..1f, 99, "%.2f".format(s.indexRate)) { v -> c.update { it.copy(indexRate = v) } }
+        ParamSlider("响度因子", s.rmsMixRate, 0f..1f, 99, "%.2f".format(s.rmsMixRate)) { v -> c.update { it.copy(rmsMixRate = v) } }
+        ParamSlider("响应阈值", s.threshold, -60f..0f, 59, if (s.threshold <= -60f) "关" else "%.0f dB".format(s.threshold)) { v -> c.update { it.copy(threshold = v) } }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Label("降噪")
+            FilterChip(s.inputNoiseReduce, { c.update { it.copy(inputNoiseReduce = !it.inputNoiseReduce) } }, label = { Text("输入") })
+            FilterChip(s.outputNoiseReduce, { c.update { it.copy(outputNoiseReduce = !it.outputNoiseReduce) } }, label = { Text("输出") })
+        }
+    }
+}
+
+@Composable
+private fun PerformanceSection() {
+    val c = RvcController
+    val s = c.settings
+    val providers = c.device?.optJSONArray("providers")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList()
+    fun avail(b: Backend) = when (b) {
+        Backend.CPU, Backend.NATIVE -> true
+        Backend.XNNPACK -> "XnnpackExecutionProvider" in providers
+        Backend.GPU -> "WebGpuExecutionProvider" in providers
+        Backend.NNAPI -> "NnapiExecutionProvider" in providers
+        Backend.QNN_HTP, Backend.QNN_GPU -> "QNNExecutionProvider" in providers
+    }
+    Section("perf", "延迟与性能", summary = "采样 %.2f s · %s + %s".format(s.blockTime, Backend.of(s.hubertBackend).short, Backend.of(s.decBackend).short),
+        defaultOpen = false) {
+        Caption("这一组在重新开始后生效。采样长度越小延迟越低，但必须大于每块的推理时间。")
+        ParamSlider("采样长度", s.blockTime, 0.1f..1.0f, 89, "%.2f s".format(s.blockTime)) { v -> c.update { it.copy(blockTime = (v * 100).roundToInt() / 100f) } }
+        ParamSlider("淡入淡出", s.crossfadeTime, 0.01f..0.15f, 13, "%.2f s".format(s.crossfadeTime)) { v -> c.update { it.copy(crossfadeTime = (v * 100).roundToInt() / 100f) } }
+        ParamSlider("额外推理", s.extraTime, 0.05f..3.0f, 58, "%.2f s".format(s.extraTime)) { v -> c.update { it.copy(extraTime = (v * 100).roundToInt() / 100f) } }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Label("HuBERT")
+            SelectField(Backend.of(s.hubertBackend).label, Backend.entries.filter { it != Backend.NATIVE && avail(it) }.map { it.id to it.label },
+                Modifier.weight(1f)) { id -> c.update { it.copy(hubertBackend = id) } }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Label("声码器")
+            SelectField(Backend.of(s.decBackend).label, Backend.entries.filter { avail(it) }.map { it.id to it.label },
+                Modifier.weight(1f)) { id -> c.update { it.copy(decBackend = id) } }
+        }
+        val big = c.device?.optJSONArray("big_cores")?.length() ?: 4
+        ParamSlider("CPU 线程", s.threads.toFloat(), 0f..8f, 7, if (s.threads == 0) "自动 $big" else "${s.threads}") { v -> c.update { it.copy(threads = v.roundToInt()) } }
+        SwitchRow("FP16 半精度", "原生 NEON / GPU / NPU", s.fp16) { v -> c.update { it.copy(fp16 = v) } }
+        SwitchRow("NSF 相位跨块连续", "实验功能", s.phaseLock) { v -> c.update { it.copy(phaseLock = v) } }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            SmallButton("性能测试", enabled = !c.running && c.busy == null && s.modelId.isNotEmpty()) { c.bench() }
+            if (c.benchResult == null) Caption("测出每块耗时，并给出可用的采样长度")
+        }
+        c.benchResult?.let {
+            Text(it, Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(MaterialTheme.colorScheme.surfaceContainerHighest).padding(10.dp),
+                style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+@Composable
+private fun AudioSection() {
+    val c = RvcController
+    val s = c.settings
+    val virtual = s.mode == AudioMode.VIRTUAL_MIC
+    Section("audio", "音频", summary = (if (virtual) "虚拟麦克风" else "本地监听") + if (s.passthrough) " · 输入监听" else "") {
+        Segmented(listOf("本地监听", "虚拟麦克风"), if (virtual) 1 else 0) { i -> c.update { it.copy(mode = if (i == 1) AudioMode.VIRTUAL_MIC else AudioMode.LOCAL) } }
+        if (virtual) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.heightIn(min = 32.dp)) {
+                Label("Shizuku")
+                Text(ShizukuBridge.stateText, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium,
+                    color = if (ShizukuBridge.state == ShizukuBridge.State.NOT_RUNNING || ShizukuBridge.state == ShizukuBridge.State.NO_PERMISSION)
+                        MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
+                if (ShizukuBridge.state == ShizukuBridge.State.NO_PERMISSION) SmallButton("授权", filled = true) { ShizukuBridge.requestPermission() }
+            }
+            SwitchRow("同时本地监听", "自己也能听到变声", s.monitor) { v -> c.update { it.copy(monitor = v) } }
+            SwitchRow("防静音底噪", "没说话时不给对方纯静音，避免录音被判为无声而中断", s.comfortNoise) { v -> c.update { it.copy(comfortNoise = v) } }
+            if (s.comfortNoise) {
+                ParamSlider("底噪电平", s.comfortNoiseDb, -80f..-40f, 39, "%.0f dB".format(s.comfortNoiseDb)) { v -> c.update { it.copy(comfortNoiseDb = v) } }
+            }
+            Explain("虚拟麦克风说明",
+                "微信、QQ 等应用录音时会自动收到变声后的声音；平时不占用麦克风。每次录音开头约 0.4–0.6 秒没有人声（不会漏出本音），采样长度越小这段越短。\n" +
+                    "开了降噪或响应阈值时，不说话的那段输出是纯静音，有些应用会据此认定麦克风异常并立刻结束录音；" +
+                    "防静音底噪会在整段录音里垫上一层和安静房间差不多的底噪（默认 −60 dB，仍被中断就调大），重新开始后生效。\n" +
+                    "首次使用会通过 Shizuku 开启「RVC 虚拟麦克风」无障碍服务，只用来让变声采集和语音消息同时进行，不读取屏幕内容。")
+        }
+        ParamSlider("输出增益", s.outputGain, 0f..3f, 29, "%.1f×".format(s.outputGain)) { v -> c.update { it.copy(outputGain = v) } }
+        Segmented(listOf("输出变声", "输入监听"), if (s.passthrough) 1 else 0) { i -> c.update { it.copy(passthrough = i == 1) } }
     }
 }
 
@@ -367,7 +551,10 @@ private fun SharedFilesDialog(sh: RvcController.SharedFiles) {
 }
 
 private const val REPO_URL = "https://github.com/nasuiyile/mobile-rvc"
-private const val BILIBILI_URL = "https://space.bilibili.com/79356601"
+private const val BILIBILI_UID = "79356601"
+private const val BILIBILI_URL = "https://space.bilibili.com/$BILIBILI_UID"
+/** Opens the profile page inside the Bilibili app; falls back to the web page when the app isn't installed. */
+private const val BILIBILI_APP_URL = "bilibili://space/$BILIBILI_UID"
 private const val RVC_URL = "https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI"
 
 /** Top-right "⋮" menu: project links and version. */
@@ -375,20 +562,22 @@ private const val RVC_URL = "https://github.com/RVC-Project/Retrieval-based-Voic
 private fun MoreInfoMenu() {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     var open by remember { mutableStateOf(false) }
-    fun openUrl(url: String) {
+    fun openUrl(url: String, appUrl: String? = null) {
         open = false
-        runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+        val view = { u: String -> ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u))) }
+        runCatching { view(appUrl ?: url) }
+            .recoverCatching { if (appUrl != null) view(url) else throw it }
             .onFailure { RvcController.message = "无法打开链接：$url" }
     }
     @Composable
-    fun LinkItem(title: String, subtitle: String, url: String) = DropdownMenuItem(
+    fun LinkItem(title: String, subtitle: String, url: String, appUrl: String? = null) = DropdownMenuItem(
         text = {
             Column {
                 Text(title)
                 Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         },
-        onClick = { openUrl(url) },
+        onClick = { openUrl(url, appUrl) },
     )
     Box {
         IconButton(onClick = { open = true }, modifier = Modifier.semantics { contentDescription = "更多信息" }) {
@@ -396,7 +585,7 @@ private fun MoreInfoMenu() {
         }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             LinkItem("GitHub：给个 Star", "nasuiyile/mobile-rvc", REPO_URL)
-            LinkItem("B 站：关注我", "space.bilibili.com/79356601", BILIBILI_URL)
+            LinkItem("B 站：关注我", "space.bilibili.com/$BILIBILI_UID", BILIBILI_URL, BILIBILI_APP_URL)
             LinkItem("原版 RVC 项目", "RVC-Project/Retrieval-based-Voice-Conversion-WebUI", RVC_URL)
             HorizontalDivider()
             DropdownMenuItem(text = { Text("版本 ${BuildConfig.VERSION_NAME}") }, onClick = {}, enabled = false)
@@ -404,56 +593,205 @@ private fun MoreInfoMenu() {
     }
 }
 
+// ---------------------------------------------------------------------------- building blocks
 @Composable
-private fun Section(title: String, content: @Composable () -> Unit) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            content()
+private fun Panel(content: @Composable () -> Unit) {
+    Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerLow, content = content)
+}
+
+/** A card that folds down to its title and a one-line summary; the state is remembered. */
+@Composable
+private fun Section(key: String, title: String, summary: String, defaultOpen: Boolean = true, content: @Composable ColumnScope.() -> Unit) {
+    val prefs = LocalContext.current.getSharedPreferences("ui", Context.MODE_PRIVATE)
+    var open by remember { mutableStateOf(prefs.getBoolean("open_$key", defaultOpen)) }
+    Panel {
+        Column {
+            Row(
+                Modifier.fillMaxWidth().clickable(role = Role.Button) {
+                    open = !open
+                    prefs.edit().putBoolean("open_$key", open).apply()
+                }.padding(horizontal = 14.dp, vertical = 11.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text(if (open) "" else summary, Modifier.weight(1f).padding(horizontal = 10.dp), style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.End)
+                Chevron(open)
+            }
+            AnimatedVisibility(open) {
+                Column(Modifier.padding(start = 14.dp, end = 14.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp), content = content)
+            }
         }
     }
 }
 
+/** Points down, turns up when open. */
 @Composable
-private fun LabeledSlider(label: String, value: Float, range: ClosedFloatingPointRange<Float>, steps: Int, fmt: String, onChange: (Float) -> Unit) {
-    Column {
-        Row {
-            Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-            Text(fmt.format(value), style = MaterialTheme.typography.bodyMedium)
-        }
+private fun Chevron(open: Boolean) {
+    val turn by animateFloatAsState(if (open) 180f else 0f, label = "chevron")
+    val color = MaterialTheme.colorScheme.onSurfaceVariant
+    Canvas(Modifier.size(18.dp).rotate(turn)) {
+        val w = size.width
+        val h = size.height
+        val stroke = 1.8.dp.toPx()
+        drawLine(color, Offset(w * 0.25f, h * 0.38f), Offset(w * 0.5f, h * 0.64f), stroke, StrokeCap.Round)
+        drawLine(color, Offset(w * 0.5f, h * 0.64f), Offset(w * 0.75f, h * 0.38f), stroke, StrokeCap.Round)
+    }
+}
+
+private val LabelWidth = 76.dp
+
+/** Left column of a settings row. */
+@Composable
+private fun Label(text: String) {
+    Text(text, Modifier.width(LabelWidth), style = MaterialTheme.typography.bodyMedium, maxLines = 2, lineHeight = 16.sp)
+}
+
+@Composable
+private fun Caption(text: String, modifier: Modifier = Modifier) {
+    Text(text, modifier, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+@Composable
+private fun Tag(text: String) {
+    Text(text, Modifier.clip(RoundedCornerShape(6.dp)).background(MaterialTheme.colorScheme.secondaryContainer).padding(horizontal = 6.dp, vertical = 2.dp),
+        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSecondaryContainer)
+}
+
+/** One row: label, slider, value. The slider snaps to `steps` intermediate positions. */
+@Composable
+private fun ParamSlider(label: String, value: Float, range: ClosedFloatingPointRange<Float>, steps: Int, text: String, onChange: (Float) -> Unit) {
+    Row(Modifier.fillMaxWidth().height(36.dp), verticalAlignment = Alignment.CenterVertically) {
+        Label(label)
         val span = range.endInclusive - range.start
-        Slider(
-            value = value.coerceIn(range),
-            onValueChange = { v ->
-                // snap to the step grid without drawing tick marks
-                val n = (steps + 1).coerceAtLeast(1)
-                onChange(range.start + ((v - range.start) / span * n).roundToInt() * span / n)
-            },
-            valueRange = range,
-        )
+        SlimSlider(label, value, range, Modifier.weight(1f)) { v ->
+            val n = (steps + 1).coerceAtLeast(1)
+            onChange(range.start + ((v - range.start) / span * n).roundToInt() * span / n)
+        }
+        Text(text, Modifier.width(60.dp), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.End, maxLines = 1)
+    }
+}
+
+/**
+ * A slider drawn slim (4 dp track, 18 dp round thumb) so that rows can sit close together;
+ * Material's own thumb is 44 dp tall. Tap anywhere on the track or drag horizontally; vertical
+ * drags still scroll the page.
+ */
+@Composable
+private fun SlimSlider(label: String, value: Float, range: ClosedFloatingPointRange<Float>, modifier: Modifier = Modifier, onChange: (Float) -> Unit) {
+    val active = MaterialTheme.colorScheme.primary
+    val inactive = MaterialTheme.colorScheme.surfaceContainerHighest
+    val span = range.endInclusive - range.start
+    val frac = if (span > 0) ((value - range.start) / span).coerceIn(0f, 1f) else 0f
+    val thumb = with(LocalDensity.current) { 9.dp.toPx() }  // radius: the track is inset by it
+    val set by rememberUpdatedState(onChange)
+    var width by remember { mutableStateOf(1) }
+    var dragX by remember { mutableStateOf(0f) }
+    fun valueAt(x: Float) = range.start + ((x - thumb) / (width - 2 * thumb).coerceAtLeast(1f)).coerceIn(0f, 1f) * span
+    Canvas(
+        modifier.height(36.dp)
+            .onSizeChanged { width = it.width }
+            .semantics {
+                contentDescription = label
+                progressBarRangeInfo = ProgressBarRangeInfo(value, range)
+                setProgress { v -> set(v.coerceIn(range)); true }
+            }
+            .pointerInput(range) { detectTapGestures { o -> set(valueAt(o.x)) } }
+            .draggable(
+                rememberDraggableState { d ->
+                    dragX += d
+                    set(valueAt(dragX))
+                },
+                Orientation.Horizontal, onDragStarted = { o -> dragX = o.x },
+            ),
+    ) {
+        val y = size.height / 2
+        val x0 = thumb
+        val x1 = size.width - thumb
+        val x = x0 + (x1 - x0) * frac
+        val track = 4.dp.toPx()
+        drawLine(inactive, Offset(x0, y), Offset(x1, y), track, StrokeCap.Round)
+        drawLine(active, Offset(x0, y), Offset(x, y), track, StrokeCap.Round)
+        drawCircle(active, thumb, Offset(x, y))
+    }
+}
+
+/** The whole row toggles. */
+@Composable
+private fun SwitchRow(label: String, hint: String?, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 40.dp).clip(RoundedCornerShape(8.dp)).toggleable(checked, role = Role.Switch, onValueChange = onChange),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f).padding(vertical = 3.dp)) {
+            Text(label, style = MaterialTheme.typography.bodyMedium)
+            if (hint != null) Caption(hint)
+        }
+        Switch(checked, null, Modifier.scale(0.8f))
+    }
+}
+
+/** Two or three mutually exclusive choices in one pill. */
+@Composable
+private fun Segmented(options: List<String>, selected: Int, onSelect: (Int) -> Unit) {
+    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(50)).background(MaterialTheme.colorScheme.surfaceContainerHighest).padding(3.dp)) {
+        options.forEachIndexed { i, text ->
+            val on = i == selected
+            Box(
+                Modifier.weight(1f).clip(RoundedCornerShape(50)).background(if (on) MaterialTheme.colorScheme.primary else Color.Transparent)
+                    .clickable(role = Role.RadioButton) { onSelect(i) }.padding(vertical = 7.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(text, style = MaterialTheme.typography.labelLarge, maxLines = 1,
+                    color = if (on) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
     }
 }
 
 @Composable
-private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(label, Modifier.weight(1f))
-        Switch(checked, onChange)
-    }
+private fun SmallButton(text: String, filled: Boolean = false, enabled: Boolean = true, onClick: () -> Unit) {
+    val pad = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 0.dp)
+    if (filled) FilledTonalButton(onClick, Modifier.height(36.dp), enabled = enabled, contentPadding = pad) { Text(text) }
+    else OutlinedButton(onClick, Modifier.height(36.dp), enabled = enabled, contentPadding = pad) { Text(text) }
 }
 
+/** Drop-down that looks like a field: current choice and a chevron. */
 @Composable
-private fun Dropdown(label: String, items: List<Pair<String, String>>, onSelect: (String) -> Unit) {
+private fun SelectField(text: String, items: List<Pair<String, String>>, modifier: Modifier = Modifier, placeholder: String? = null, onSelect: (String) -> Unit) {
     var open by remember { mutableStateOf(false) }
-    Column {
-        OutlinedButton(onClick = { open = true }, modifier = Modifier.fillMaxWidth()) { Text(label) }
+    val shape = RoundedCornerShape(10.dp)
+    Box(modifier) {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 40.dp).clip(shape).border(1.dp, MaterialTheme.colorScheme.outlineVariant, shape)
+                .clickable(enabled = items.isNotEmpty(), role = Role.DropdownList) { open = true }.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(if (items.isEmpty() && placeholder != null) placeholder else text, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                color = if (items.isEmpty()) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface)
+            Chevron(open)
+        }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-            items.forEach { (id, text) ->
-                DropdownMenuItem(text = { Text(text) }, onClick = {
+            items.forEach { (id, label) ->
+                DropdownMenuItem(text = { Text(label) }, onClick = {
                     open = false
                     onSelect(id)
                 })
             }
         }
+    }
+}
+
+/** A line of small print that opens into an explanation. */
+@Composable
+private fun Explain(title: String, text: String) {
+    var open by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).clickable { open = !open }.padding(vertical = 4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(title, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+            Chevron(open)
+        }
+        AnimatedVisibility(open) { Caption(text, Modifier.padding(top = 4.dp)) }
     }
 }
