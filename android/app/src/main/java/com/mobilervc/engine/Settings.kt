@@ -21,6 +21,9 @@ enum class Backend(val id: String, val label: String, val short: String) {
 
 enum class AudioMode { LOCAL, VIRTUAL_MIC }
 
+/** The three screens behind the tabs at the top. The realtime ones also choose [AudioMode]. */
+enum class AppTab { LOCAL, VIRTUAL_MIC, CONVERT }
+
 /**
  * User settings, mirroring RVC's realtime GUI (常规设置 / 性能设置) plus mobile options.
  * Defaults favour realtime on phones: shorter extra context than the PC default of 2.5 s.
@@ -53,7 +56,25 @@ data class Settings(
     // virtual mic: a faint noise floor instead of digital silence (apps abort "dead" recordings)
     val comfortNoise: Boolean = true,
     val comfortNoiseDb: Float = -60f, // dBFS RMS
+    val tab: AppTab = AppTab.LOCAL,
+    // file conversion: RVC WebUI 模型推理 settings and defaults
+    val convPitch: Int = 0,
+    val convIndexRate: Float = 0.75f,
+    val convRmsMix: Float = 0.25f,
+    val convProtect: Float = 0.33f,
+    val convFormat: String = "wav",  // "wav" | "m4a"
 ) {
+    /** Engine cfg of an offline conversion (CPU threads and the vocoder's precision as for realtime). */
+    fun offlineConfig(device: JSONObject?): JSONObject {
+        val big = device?.optJSONArray("big_cores") ?: JSONArray()
+        val nThreads = if (threads > 0) threads else maxOf(1, minOf(6, big.length()))
+        return JSONObject().put("threads", nThreads).put("affinity", big).put("fp16", fp16).put("sid", sid)
+    }
+
+    fun offlineParams(): JSONObject = JSONObject()
+        .put("pitch", convPitch).put("index_rate", convIndexRate.toDouble())
+        .put("rms_mix_rate", convRmsMix.toDouble()).put("protect", convProtect.toDouble())
+
     fun engineConfig(ctx: Context, device: JSONObject?): JSONObject {
         val big = device?.optJSONArray("big_cores") ?: JSONArray()
         val nThreads = if (threads > 0) threads else maxOf(1, minOf(6, big.length()))
@@ -104,6 +125,15 @@ data class Settings(
                 passthrough = p.getBoolean("passthrough", d.passthrough),
                 comfortNoise = p.getBoolean("comfortNoise", d.comfortNoise),
                 comfortNoiseDb = p.getFloat("comfortNoiseDb", d.comfortNoiseDb),
+                // before the tabs existed the mode was the screen
+                tab = runCatching { AppTab.valueOf(p.getString("tab", null)!!) }.getOrElse {
+                    if (p.getString("mode", null) == AudioMode.VIRTUAL_MIC.name) AppTab.VIRTUAL_MIC else d.tab
+                },
+                convPitch = p.getInt("convPitch", d.convPitch),
+                convIndexRate = p.getFloat("convIndexRate", d.convIndexRate),
+                convRmsMix = p.getFloat("convRmsMix", d.convRmsMix),
+                convProtect = p.getFloat("convProtect", d.convProtect),
+                convFormat = p.getString("convFormat", d.convFormat)!!,
             )
         }
 
@@ -121,6 +151,10 @@ data class Settings(
                 .putBoolean("monitor", s.monitor).putFloat("outputGain", s.outputGain)
                 .putBoolean("passthrough", s.passthrough)
                 .putBoolean("comfortNoise", s.comfortNoise).putFloat("comfortNoiseDb", s.comfortNoiseDb)
+                .putString("tab", s.tab.name)
+                .putInt("convPitch", s.convPitch).putFloat("convIndexRate", s.convIndexRate)
+                .putFloat("convRmsMix", s.convRmsMix).putFloat("convProtect", s.convProtect)
+                .putString("convFormat", s.convFormat)
                 .apply()
         }
     }

@@ -3,12 +3,17 @@
 //   rvc_cli import  <assets> <model.pth> <index|-> <out_dir>
 //   rvc_cli process <assets> <model_dir> <in.wav> <out.wav> [config.json] [k=v ...]
 //   rvc_cli bench   <assets> <model_dir> [config.json] [k=v ...]
+//   rvc_cli convert <assets> <model_dir> <in.(mp3|m4a|wav|...)> <out.(wav|m4a)> [k=v ...]
+//                   (the app's offline conversion, RVC vc_single: decode, convert, encode; Android only)
+//   rvc_cli probe   <media file>
+//   rvc_cli restest <from_hz> <to_hz> [samples]   (StreamResampler vs whole-signal resampling)
 //
 // k=v pairs override config keys or live params (pitch, formant, index_rate, rms_mix_rate,
 // threshold); e.g. block_time=0.3 dec.backend=webgpu threads=4.
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -18,6 +23,7 @@
 #include "../engine/model_import.hpp"
 #include "../engine/native_decoder.hpp"
 #include "../engine/noise_gate.hpp"
+#include "../engine/offline.hpp"
 #include "../engine/ort_model.hpp"
 #include "../engine/rvc_engine.hpp"
 #include "../engine/wav.hpp"
@@ -27,10 +33,30 @@
 
 #include <thread>
 
+#include "../android/offline_file.hpp"
 #include "../android/rt_driver.hpp"
 #endif
 
 using namespace rvc;
+
+static Json parse_value(const std::string& v) {
+  if (v == "true" || v == "false") return Json(v == "true");
+  char* end = nullptr;
+  double d = strtod(v.c_str(), &end);
+  return (end && *end == 0) ? Json(d) : Json(v);
+}
+
+// VmHWM of this process, MB (0 where /proc is missing)
+static double peak_rss_mb() {
+  FILE* f = fopen("/proc/self/status", "r");
+  if (!f) return 0;
+  char line[256];
+  double kb = 0;
+  while (fgets(line, sizeof(line), f))
+    if (strncmp(line, "VmHWM:", 6) == 0) kb = atof(line + 6);
+  fclose(f);
+  return kb / 1024.0;
+}
 
 static Json parse_overrides(Json cfg, int argc, char** argv, int start, Json* live) {
   for (int i = start; i < argc; ++i) {
@@ -41,13 +67,7 @@ static Json parse_overrides(Json cfg, int argc, char** argv, int start, Json* li
       continue;
     }
     std::string k = a.substr(0, eq), v = a.substr(eq + 1);
-    Json val;
-    if (v == "true" || v == "false") val = Json(v == "true");
-    else {
-      char* end = nullptr;
-      double d = strtod(v.c_str(), &end);
-      val = (end && *end == 0) ? Json(d) : Json(v);
-    }
+    Json val = parse_value(v);
     if (k == "pitch" || k == "formant" || k == "index_rate" || k == "rms_mix_rate" || k == "threshold" ||
         k == "input_nr" || k == "output_nr") {
       live->set(k, val);
@@ -123,6 +143,32 @@ int main(int argc, char** argv) {
       return 0;
     }
 #ifdef __ANDROID__
+    if (cmd == "probe" && argc >= 3) {
+      printf("%s\n", probe_media(argv[2]).dump().c_str());
+      return 0;
+    }
+    if (cmd == "convert" && argc >= 6) {
+      // the app's offline conversion (RVC vc_single): k=v sets OfflineParams (pitch, index_rate,
+      // rms_mix_rate, protect, deterministic, x_pad/x_query/x_center/x_max, dec_chunk) and
+      // threads / fp16 / sid
+      Json pj = Json::object();
+      for (int i = 6; i < argc; ++i) {
+        std::string a = argv[i];
+        size_t eq = a.find('=');
+        if (eq != std::string::npos) pj.set(a.substr(0, eq), parse_value(a.substr(eq + 1)));
+      }
+      BackendConfig cpu;
+      cpu.threads = static_cast<int>(pj.num_or("threads", 4));
+      OfflinePipeline pipe(argv[2], argv[3], cpu, pj.bool_or("fp16", true), static_cast<int>(pj.num_or("sid", 0)));
+      std::string out = argv[5];
+      std::string fmt = out.size() > 4 && out.substr(out.size() - 4) == ".m4a" ? "m4a" : "wav";
+      OfflineProgress prog;
+      Json r = convert_file(pipe, OfflineParams::from_json(pj), argv[4], out, fmt, &prog);
+      r.set("pipeline", pipe.info());
+      r.set("peak_rss_mb", peak_rss_mb());
+      printf("%s\n", r.dump().c_str());
+      return 0;
+    }
     if (cmd == "pipetest" && argc >= 6) {
       // realtime driver in virtual-mic (pipe) mode, input paced in real time:
       // pipetest <assets> <model_dir> <in.wav> <out.wav> [k=v ...]
@@ -209,6 +255,29 @@ int main(int argc, char** argv) {
       printf("%s %s (%s): snr %.1f dB vs CPU fp32, %.1f ms\n", name.c_str(), accel.c_str(), m.backend_used().c_str(),
              10 * log10(den / std::max(num, 1e-30)), ms);
       return 0;
+    }
+    if (cmd == "restest" && argc >= 4) {
+      // the piecewise resampler must reproduce the whole-signal one exactly, for any read sizes
+      int from = atoi(argv[2]), to = atoi(argv[3]);
+      size_t N = argc > 4 ? static_cast<size_t>(atol(argv[4])) : 100003;
+      std::vector<float> x(N);
+      std::mt19937 rng(3);
+      std::uniform_real_distribution<float> u(-1.f, 1.f);
+      for (auto& v : x) v = u(rng);
+      std::vector<float> ref = SincResampler(from, to)(x.data(), static_cast<int>(N));
+      StreamResampler rs(from, to);
+      std::vector<float> y;
+      std::uniform_int_distribution<size_t> step(1, 9000);
+      for (size_t i = 0; i < N;) {
+        size_t n = std::min(N - i, step(rng));
+        rs.push(x.data() + i, n, y);
+        i += n;
+      }
+      rs.finish(y);
+      double maxd = 0;
+      for (size_t i = 0; i < std::min(y.size(), ref.size()); ++i) maxd = std::max(maxd, static_cast<double>(std::fabs(y[i] - ref[i])));
+      printf("%d -> %d: %zu in, %zu out (whole: %zu), max |diff| %g\n", from, to, N, y.size(), ref.size(), maxd);
+      return y.size() == ref.size() && maxd == 0 ? 0 : 1;
     }
     if (cmd == "gatetest" && argc >= 6) {
       // gatetest <x.f32> <noise.f32> <out.f32> <sr> : TorchGate port on raw float32 files
@@ -315,6 +384,7 @@ int main(int argc, char** argv) {
       r.set("worst_ms", worst);
       r.set("block_ms", bms);
       r.set("rtf", sum[0] / n / bms);
+      r.set("peak_rss_mb", peak_rss_mb());
       printf("%s\n", r.dump().c_str());
       return 0;
     }

@@ -25,6 +25,10 @@ namespace rvc {
 class IvfIndex;
 class NativeDecoder;
 
+// Copies the app's current graph files into an imported model when its weight layout is
+// unchanged (models imported by an older version keep working with corrected graphs).
+void refresh_model_graphs(const std::string& assets, const std::string& model_dir, const Json& meta);
+
 struct EngineConfig {
   int sample_rate = 48000;      // device I/O rate
   double block_time = 0.25;     // s, multiple of 10 ms
@@ -63,6 +67,8 @@ class RvcEngine {
   ~RvcEngine();
 
   void load(const std::string& model_dir, const EngineConfig& cfg);
+  // Frees the models (memory for an offline conversion); load() again before use.
+  void unload();
   bool loaded() const { return loaded_; }
   const EngineConfig& config() const { return cfg_; }
   int block_frame() const { return block_frame_; }

@@ -26,6 +26,7 @@ add_library(rvc_engine STATIC
   engine/model_import.cpp
   engine/native_decoder.cpp
   engine/noise_gate.cpp
+  engine/offline.cpp
   engine/ort_model.cpp
   engine/pth_reader.cpp
   engine/rvc_engine.cpp)
@@ -36,12 +37,12 @@ if(ANDROID_ABI STREQUAL "arm64-v8a")
 endif()
 target_link_libraries(rvc_engine PUBLIC onnxruntime log)
 
-add_library(rvc SHARED android/jni_bridge.cpp android/rt_driver.cpp)
+add_library(rvc SHARED android/jni_bridge.cpp android/rt_driver.cpp android/offline_file.cpp)
 target_compile_options(rvc PRIVATE ${RVC_OPT})
-target_link_libraries(rvc PRIVATE rvc_engine aaudio android log)
+target_link_libraries(rvc PRIVATE rvc_engine aaudio mediandk android log)
 target_link_options(rvc PRIVATE -Wl,--gc-sections)
 
 # Command line tool for `adb shell` benchmarks (not packaged in the APK).
-add_executable(rvc_cli tools/rvc_cli.cpp android/rt_driver.cpp)
+add_executable(rvc_cli tools/rvc_cli.cpp android/rt_driver.cpp android/offline_file.cpp)
 target_compile_options(rvc_cli PRIVATE ${RVC_OPT})
-target_link_libraries(rvc_cli PRIVATE rvc_engine aaudio android log)
+target_link_libraries(rvc_cli PRIVATE rvc_engine aaudio mediandk android log)

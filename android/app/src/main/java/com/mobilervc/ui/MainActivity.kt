@@ -12,7 +12,9 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import android.os.SystemClock
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -40,7 +42,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -103,8 +107,10 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
 import com.mobilervc.BuildConfig
+import com.mobilervc.engine.AppTab
 import com.mobilervc.engine.AudioMode
 import com.mobilervc.engine.Backend
+import com.mobilervc.engine.Converter
 import com.mobilervc.engine.RvcController
 import com.mobilervc.service.VoiceService
 import com.mobilervc.shizuku.ShizukuBridge
@@ -127,7 +133,7 @@ class MainActivity : ComponentActivity() {
         handleShare(intent)
     }
 
-    /** .pth / .index opened ("用其他应用打开") or shared from QQ, WeChat, file managers... */
+    /** .pth / .index / audio opened ("用其他应用打开") or shared from QQ, WeChat, file managers... */
     private fun handleShare(intent: Intent?) {
         intent ?: return
         val uris = mutableListOf<Uri>()
@@ -146,6 +152,22 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         ShizukuBridge.refresh()
         RvcController.refreshModels()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        visible = true
+    }
+
+    override fun onStop() {
+        visible = false
+        AudioPreview.stop()
+        super.onStop()
+    }
+
+    companion object {
+        /** In front: a finished file conversion needs no notification. */
+        @Volatile var visible = false
     }
 }
 
@@ -191,13 +213,15 @@ private fun Screen() {
         uri?.let { u -> c.importBasePack { ctx.contentResolver.openInputStream(u)!! } }
     }
 
+    val tab = s.tab
+    val scroll = remember(tab) { ScrollState(0) }  // every screen starts at its top
     Scaffold(
         topBar = { TopBar() },
-        bottomBar = { BottomBar() },
+        bottomBar = { if (tab == AppTab.CONVERT) ConvertBar() else BottomBar() },
         containerColor = MaterialTheme.colorScheme.surface,
     ) { pad ->
         Column(
-            Modifier.fillMaxSize().padding(pad).verticalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
+            Modifier.fillMaxSize().padding(pad).verticalScroll(scroll).padding(horizontal = 12.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             if (!c.assetsReady && c.installProgress == null) {
@@ -210,9 +234,29 @@ private fun Screen() {
                 }
             }
             ModelSection(onImport = { showImport = true })
-            VoiceSection()
-            AudioSection()
-            PerformanceSection()
+            when (tab) {
+                AppTab.LOCAL -> {
+                    VoiceSection()
+                    LocalAudioSection()
+                    PerformanceSection()
+                }
+                AppTab.VIRTUAL_MIC -> {
+                    VoiceSection()
+                    VirtualMicSection()
+                    PerformanceSection()
+                }
+                AppTab.CONVERT -> {
+                    ConvertInputSection()
+                    ConvertParamsSection()
+                    ConvertResultsSection()
+                }
+            }
+        }
+    }
+    if (AudioPreview.playing != null) LaunchedEffect(AudioPreview.playing) {
+        while (true) {
+            AudioPreview.tick()
+            delay(200)
         }
     }
 
@@ -221,6 +265,7 @@ private fun Screen() {
         c.importModel(pth, idx)
     }
     c.shared?.let { sh -> SharedFilesDialog(sh) }
+    Converter.finished?.let { r -> FinishedDialog(r) }
     c.message?.let { msg -> MessageDialog(msg) { c.message = null } }
 }
 
@@ -256,12 +301,13 @@ private fun TopBar() {
     Surface(color = MaterialTheme.colorScheme.surface) {
         Column(Modifier.windowInsetsPadding(WindowInsets.statusBars)) {
             Row(Modifier.fillMaxWidth().height(48.dp).padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("RVC 实时变声", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text("rvc手机版", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.width(8.dp))
                 Tag("FCPE")
                 Spacer(Modifier.weight(1f))
                 MoreInfoMenu()
             }
+            TabBar()
             // whatever is in progress (asset install, import, model load, warm-up, benchmark)
             val install = c.installProgress
             val busy = c.busy ?: install?.let { "正在安装基础模型（HuBERT / FCPE）…" }
@@ -290,7 +336,11 @@ private fun BottomBar() {
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             if (c.running) StatusStrip()
-            val busy = c.busy
+            val busy = c.busy ?: if (Converter.converting) "正在转换文件…" else null
+            val shown = if (c.settings.tab == AppTab.VIRTUAL_MIC) AudioMode.VIRTUAL_MIC else AudioMode.LOCAL
+            if (c.running && c.runningMode != shown) {
+                Caption("正在以「${modeName(c.runningMode)}」运行，停止后再开始才会换成「${modeName(shown)}」。")
+            }
             if (c.running) {
                 FilledTonalButton(
                     onClick = { VoiceService.stop(ctx) }, modifier = Modifier.fillMaxWidth().height(46.dp),
@@ -315,6 +365,8 @@ private fun BottomBar() {
     }
 }
 
+private fun modeName(m: AudioMode) = if (m == AudioMode.VIRTUAL_MIC) "虚拟麦克风" else "本地监听"
+
 /** Live status above the stop button: one line, tap for the details. */
 @Composable
 private fun StatusStrip() {
@@ -322,7 +374,7 @@ private fun StatusStrip() {
     val st = c.status?.takeIf { it.optBoolean("running") }
     val prefs = LocalContext.current.getSharedPreferences("ui", Context.MODE_PRIVATE)
     var details by remember { mutableStateOf(prefs.getBoolean("open_status", false)) }
-    val virtual = c.settings.mode == AudioMode.VIRTUAL_MIC
+    val virtual = c.runningMode == AudioMode.VIRTUAL_MIC
     val active = !virtual || c.captureMode != 0
     val small = MaterialTheme.typography.bodySmall
     val dim = MaterialTheme.colorScheme.onSurfaceVariant
@@ -414,13 +466,14 @@ private fun ModelSection(onImport: () -> Unit) {
             placeholder = "还没有模型，请先导入 .pth",
         ) { id -> c.update { st -> st.copy(modelId = id) } }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            SmallButton("导入 .pth", filled = true, enabled = c.assetsReady && c.busy == null, onClick = onImport)
-            SmallButton(if (current?.hasIndex == true) "更换 .index" else "添加 .index", enabled = current != null && c.busy == null) {
+            val idle = c.busy == null && !Converter.converting
+            SmallButton("导入 .pth", filled = true, enabled = c.assetsReady && idle, onClick = onImport)
+            SmallButton(if (current?.hasIndex == true) "更换 .index" else "添加 .index", enabled = current != null && idle) {
                 indexPicker.launch(arrayOf("*/*"))
             }
             Spacer(Modifier.weight(1f))
             if (current != null) {
-                TextButton(onClick = { c.deleteModel(current) }, enabled = !c.running,
+                TextButton(onClick = { c.deleteModel(current) }, enabled = !c.running && !Converter.converting,
                     colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("删除") }
             }
         }
@@ -478,7 +531,7 @@ private fun PerformanceSection() {
         SwitchRow("FP16 半精度", "原生 NEON / GPU / NPU", s.fp16) { v -> c.update { it.copy(fp16 = v) } }
         SwitchRow("NSF 相位跨块连续", "实验功能", s.phaseLock) { v -> c.update { it.copy(phaseLock = v) } }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            SmallButton("性能测试", enabled = !c.running && c.busy == null && s.modelId.isNotEmpty()) { c.bench() }
+            SmallButton("性能测试", enabled = !c.running && c.busy == null && !Converter.converting && s.modelId.isNotEmpty()) { c.bench() }
             if (c.benchResult == null) Caption("测出每块的推理耗时")
         }
         c.benchResult?.let {
@@ -489,34 +542,265 @@ private fun PerformanceSection() {
 }
 
 @Composable
-private fun AudioSection() {
+private fun LocalAudioSection() {
     val c = RvcController
     val s = c.settings
-    val virtual = s.mode == AudioMode.VIRTUAL_MIC
-    Section("audio", "音频", summary = (if (virtual) "虚拟麦克风" else "本地监听") + if (s.passthrough) " · 输入监听" else "") {
-        Segmented(listOf("本地监听", "虚拟麦克风"), if (virtual) 1 else 0) { i -> c.update { it.copy(mode = if (i == 1) AudioMode.VIRTUAL_MIC else AudioMode.LOCAL) } }
-        if (virtual) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.heightIn(min = 32.dp)) {
-                Label("Shizuku")
-                Text(ShizukuBridge.stateText, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium,
-                    color = if (ShizukuBridge.state == ShizukuBridge.State.NOT_RUNNING || ShizukuBridge.state == ShizukuBridge.State.NO_PERMISSION)
-                        MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
-                if (ShizukuBridge.state == ShizukuBridge.State.NO_PERMISSION) SmallButton("授权", filled = true) { ShizukuBridge.requestPermission() }
-            }
-            SwitchRow("同时本地监听", "自己也能听到变声", s.monitor) { v -> c.update { it.copy(monitor = v) } }
-            SwitchRow("防静音底噪", "没说话时不给对方纯静音，避免录音被判为无声而中断", s.comfortNoise) { v -> c.update { it.copy(comfortNoise = v) } }
-            if (s.comfortNoise) {
-                ParamSlider("底噪电平", s.comfortNoiseDb, -80f..-40f, 39, "%.0f dB".format(s.comfortNoiseDb)) { v -> c.update { it.copy(comfortNoiseDb = v) } }
-            }
-            Explain("虚拟麦克风说明",
-                "微信、QQ 等应用录音时会自动收到变声后的声音；平时不占用麦克风。每次录音开头约 0.4–0.6 秒没有人声（不会漏出本音），采样长度越小这段越短。\n" +
-                    "开了降噪或响应阈值时，不说话的那段输出是纯静音，有些应用会据此认定麦克风异常并立刻结束录音；" +
-                    "防静音底噪会在整段录音里垫上一层和安静房间差不多的底噪（默认 −60 dB，仍被中断就调大），重新开始后生效。\n" +
-                    "首次使用会通过 Shizuku 开启「RVC 虚拟麦克风」无障碍服务，只用来让变声采集和语音消息同时进行，不读取屏幕内容。")
-        }
+    Section("audio", "本地监听", summary = "增益 %.1f×".format(s.outputGain) + if (s.passthrough) " · 输入监听" else "") {
+        Caption("麦克风 → 变声 → 耳机。戴上耳机后点「开始音频转换」，避免啸叫。")
         ParamSlider("输出增益", s.outputGain, 0f..3f, 29, "%.1f×".format(s.outputGain)) { v -> c.update { it.copy(outputGain = v) } }
         Segmented(listOf("输出变声", "输入监听"), if (s.passthrough) 1 else 0) { i -> c.update { it.copy(passthrough = i == 1) } }
     }
+}
+
+@Composable
+private fun VirtualMicSection() {
+    val c = RvcController
+    val s = c.settings
+    Section("vmic", "虚拟麦克风", summary = ShizukuBridge.stateText + if (s.monitor) " · 本地监听" else "") {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.heightIn(min = 32.dp)) {
+            Label("Shizuku")
+            Text(ShizukuBridge.stateText, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium,
+                color = if (ShizukuBridge.state == ShizukuBridge.State.NOT_RUNNING || ShizukuBridge.state == ShizukuBridge.State.NO_PERMISSION)
+                    MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
+            if (ShizukuBridge.state == ShizukuBridge.State.NO_PERMISSION) SmallButton("授权", filled = true) { ShizukuBridge.requestPermission() }
+        }
+        SwitchRow("同时本地监听", "自己也能听到变声", s.monitor) { v -> c.update { it.copy(monitor = v) } }
+        SwitchRow("防静音底噪", "没说话时不给对方纯静音，避免录音被判为无声而中断", s.comfortNoise) { v -> c.update { it.copy(comfortNoise = v) } }
+        if (s.comfortNoise) {
+            ParamSlider("底噪电平", s.comfortNoiseDb, -80f..-40f, 39, "%.0f dB".format(s.comfortNoiseDb)) { v -> c.update { it.copy(comfortNoiseDb = v) } }
+        }
+        Explain("虚拟麦克风说明",
+            "微信、QQ 等应用录音时会自动收到变声后的声音；平时不占用麦克风。每次录音开头约 0.4–0.6 秒没有人声（不会漏出本音），采样长度越小这段越短。\n" +
+                "开了降噪或响应阈值时，不说话的那段输出是纯静音，有些应用会据此认定麦克风异常并立刻结束录音；" +
+                "防静音底噪会在整段录音里垫上一层和安静房间差不多的底噪（默认 −60 dB，仍被中断就调大），重新开始后生效。\n" +
+                "首次使用会通过 Shizuku 开启「RVC 虚拟麦克风」无障碍服务，只用来让变声采集和语音消息同时进行，不读取屏幕内容。")
+        ParamSlider("输出增益", s.outputGain, 0f..3f, 29, "%.1f×".format(s.outputGain)) { v -> c.update { it.copy(outputGain = v) } }
+        Segmented(listOf("输出变声", "输入监听"), if (s.passthrough) 1 else 0) { i -> c.update { it.copy(passthrough = i == 1) } }
+    }
+}
+
+// ---------------------------------------------------------------------------- tabs
+/**
+ * The three screens, always at the top: the selected tab is filled with the primary colour; a
+ * dot marks the mode that is running, the percentage a file that is converting.
+ */
+@Composable
+private fun TabBar() {
+    val c = RvcController
+    val cs = MaterialTheme.colorScheme
+    val tabs = listOf(AppTab.LOCAL to "本地监听", AppTab.VIRTUAL_MIC to "虚拟麦克风", AppTab.CONVERT to "文件转换")
+    Row(
+        Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, bottom = 8.dp).clip(RoundedCornerShape(14.dp))
+            .background(cs.surfaceContainerHighest).padding(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        tabs.forEach { (tab, label) ->
+            val on = c.settings.tab == tab
+            val bg by animateColorAsState(if (on) cs.primary else Color.Transparent, label = "tab")
+            val fg = if (on) cs.onPrimary else cs.onSurfaceVariant
+            val active = when (tab) {
+                AppTab.LOCAL -> c.running && c.runningMode == AudioMode.LOCAL
+                AppTab.VIRTUAL_MIC -> c.running && c.runningMode == AudioMode.VIRTUAL_MIC
+                AppTab.CONVERT -> Converter.converting
+            }
+            Row(
+                Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(10.dp)).background(bg)
+                    .selectable(selected = on, role = Role.Tab) { c.selectTab(tab) },
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (active) {
+                    Box(Modifier.size(7.dp).clip(CircleShape).background(if (on) cs.onPrimary else cs.primary))
+                    Spacer(Modifier.width(5.dp))
+                }
+                Text(label, style = MaterialTheme.typography.titleSmall, fontWeight = if (on) FontWeight.Bold else FontWeight.Medium,
+                    color = fg, maxLines = 1)
+                if (tab == AppTab.CONVERT && Converter.converting && Converter.progress > 0f) {
+                    Text(" %d%%".format((Converter.progress * 100).roundToInt()), style = MaterialTheme.typography.labelSmall, color = fg)
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------- file conversion
+@Composable
+private fun ConvertInputSection() {
+    val conv = Converter
+    val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { conv.pick(it) } }
+    val input = conv.input
+    Section("cin", "音频文件", summary = input?.name ?: "未选择") {
+        if (input != null) {
+            Text(input.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Caption("${Converter.clock(input.durationS)} · ${input.info}")
+            PlayProgress(input.file)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                SmallButton(if (AudioPreview.playing == input.file) "停止试听" else "试听原音") { AudioPreview.toggle(input.file) }
+                SmallButton("换一个文件", enabled = !conv.staging && !conv.converting) { pick.launch(arrayOf("audio/*", "video/*", "application/ogg")) }
+            }
+        } else {
+            Caption("选择要变声的歌曲、录音或视频（mp3、m4a、wav、flac、ogg、amr，或视频里的声音）。")
+            SmallButton("选择音频文件", filled = true, enabled = !conv.staging) { pick.launch(arrayOf("audio/*", "video/*", "application/ogg")) }
+        }
+        if (conv.staging) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Caption("读取文件…")
+            }
+        }
+        Explain("从其他应用打开",
+            "在微信、QQ、文件管理器、录音机、音乐播放器里，对音频选择「用其他应用打开」或「分享」，再选「用 rvc手机版 变声」，" +
+                "就会来到这里并载入文件。微信 / QQ 的语音消息是 SILK 编码，系统解码不了，需要先转成 mp3 等格式。")
+    }
+}
+
+@Composable
+private fun ConvertParamsSection() {
+    val c = RvcController
+    val s = c.settings
+    Section("cparams", "转换参数", summary = "变调 %+d · 检索 %.2f · %s".format(s.convPitch, s.convIndexRate, s.convFormat.uppercase())) {
+        ParamSlider("变调", s.convPitch.toFloat(), -24f..24f, 47, "%+d".format(s.convPitch)) { v -> c.update { it.copy(convPitch = v.roundToInt()) } }
+        ParamSlider("检索占比", s.convIndexRate, 0f..1f, 99, "%.2f".format(s.convIndexRate)) { v -> c.update { it.copy(convIndexRate = v) } }
+        ParamSlider("音量融合", s.convRmsMix, 0f..1f, 99, "%.2f".format(s.convRmsMix)) { v -> c.update { it.copy(convRmsMix = v) } }
+        ParamSlider("保护清辅音", s.convProtect, 0f..0.5f, 49, if (s.convProtect >= 0.5f) "关" else "%.2f".format(s.convProtect)) { v ->
+            c.update { it.copy(convProtect = v) }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Label("输出格式")
+            Box(Modifier.weight(1f)) {
+                Segmented(listOf("WAV 无损", "M4A 体积小"), if (s.convFormat == "m4a") 1 else 0) { i ->
+                    c.update { it.copy(convFormat = if (i == 1) "m4a" else "wav") }
+                }
+            }
+        }
+        Explain("参数说明",
+            "和 RVC WebUI「模型推理」一样处理整段音频（音高算法 FCPE），默认值也相同。\n" +
+                "变调：半音数，升八度 +12、降八度 −12；男声转女声常用 +12。\n" +
+                "检索占比（检索特征占比）：用模型索引（.index）替换音色特征的比例，越高越像目标音色，太高可能吐字含糊；模型没有索引时不起作用。\n" +
+                "音量融合（输入源音量包络替换输出音量包络融合比例）：越靠近 1 越保留模型输出的音量起伏，越靠近 0 越跟随原音频。\n" +
+                "保护清辅音：保护清辅音和呼吸声，减少电音撕裂；0.5 为不开启。\n" +
+                "WAV 和 RVC 一样按模型采样率输出；M4A（AAC）体积约为 WAV 的十分之一，适合发给别人。\n" +
+                "「延迟与性能」里的 CPU 线程和 FP16 也用于这里；转换时手机可以锁屏或切到别的应用。")
+    }
+}
+
+@Composable
+private fun ConvertResultsSection() {
+    val results = Converter.results
+    Section("cresults", "转换结果", summary = if (results.isEmpty()) "无" else "${results.size} 个") {
+        if (results.isEmpty()) {
+            Caption("转换好的音频会出现在这里，可以试听、分享给微信 / QQ 好友，或保存到「音乐/RVC」。")
+        }
+        results.forEachIndexed { i, r ->
+            if (i > 0) HorizontalDivider(Modifier.padding(vertical = 4.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            ResultRow(r)
+        }
+    }
+}
+
+private fun sizeText(bytes: Long) = if (bytes >= 1 shl 20) "%.1f MB".format(bytes / 1048576.0) else "%d KB".format(bytes / 1024)
+
+@Composable
+private fun ResultRow(r: Converter.Result, showDelete: Boolean = true) {
+    val ctx = LocalContext.current
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(r.file.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        Caption("${Converter.clock(r.durationS)} · ${sizeText(r.size)} · ${r.format.uppercase()} · ${r.model} 变调 %+d".format(r.pitch))
+        PlayProgress(r.file)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = { AudioPreview.toggle(r.file) }) { Text(if (AudioPreview.playing == r.file) "停止" else "播放") }
+            TextButton(onClick = { runCatching { Converter.share(ctx, r) }.onFailure { RvcController.message = "无法分享：${it.message}" } }) { Text("分享") }
+            TextButton(onClick = { Converter.saveToMusic(r) }) { Text("保存到音乐") }
+            Spacer(Modifier.weight(1f))
+            if (showDelete) {
+                TextButton(onClick = {
+                    if (AudioPreview.playing == r.file) AudioPreview.stop()
+                    Converter.delete(r)
+                }, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text("删除") }
+            }
+        }
+    }
+}
+
+/** Position of the file that is playing, when it is this one. */
+@Composable
+private fun PlayProgress(f: java.io.File) {
+    if (AudioPreview.playing != f) return
+    val d = AudioPreview.durationMs.coerceAtLeast(1)
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        LinearProgressIndicator(progress = { AudioPreview.positionMs.toFloat() / d }, modifier = Modifier.weight(1f).height(3.dp))
+        Spacer(Modifier.width(8.dp))
+        Caption("${Converter.clock(AudioPreview.positionMs / 1000.0)} / ${Converter.clock(d / 1000.0)}")
+    }
+}
+
+/** Bottom bar of the conversion screen: start, progress and cancel, or why it cannot start. */
+@Composable
+private fun ConvertBar() {
+    val c = RvcController
+    val conv = Converter
+    val ctx = LocalContext.current
+    Surface(color = MaterialTheme.colorScheme.surfaceContainer, shadowElevation = 8.dp) {
+        Column(
+            Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.navigationBars).padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            when {
+                c.running -> {
+                    Caption("实时变声（${modeName(c.runningMode)}）正在运行，停止后才能转换文件。")
+                    FilledTonalButton(
+                        onClick = { VoiceService.stop(ctx) }, modifier = Modifier.fillMaxWidth().height(46.dp),
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer, contentColor = MaterialTheme.colorScheme.onErrorContainer),
+                    ) { Text("停止实时变声", fontWeight = FontWeight.SemiBold) }
+                }
+                conv.converting -> {
+                    val p = conv.progress
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(if (p <= 0f) "加载模型…" else "转换中 %d%%".format((p * 100).roundToInt()),
+                                style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                            if (p <= 0f) LinearProgressIndicator(Modifier.fillMaxWidth().height(4.dp))
+                            else LinearProgressIndicator(progress = { p }, modifier = Modifier.fillMaxWidth().height(4.dp))
+                            val elapsed = (SystemClock.elapsedRealtime() - conv.startedAt) / 1000.0
+                            Caption(if (p > 0.1f) "已用 ${Converter.clock(elapsed)} · 剩余约 ${Converter.clock(elapsed * (1 - p) / p)}"
+                                else "已用 ${Converter.clock(elapsed)}")
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        OutlinedButton(onClick = { conv.cancel() }) { Text("取消") }
+                    }
+                }
+                else -> {
+                    val model = c.models.firstOrNull { it.id == c.settings.modelId }
+                    val why = when {
+                        !c.assetsReady -> "基础模型未就绪"
+                        model == null -> "先在上面选择或导入模型"
+                        conv.input == null -> "先选择音频文件"
+                        else -> null
+                    }
+                    Button(
+                        onClick = { conv.start(ctx)?.let { c.message = it } }, modifier = Modifier.fillMaxWidth().height(46.dp),
+                        enabled = why == null && c.busy == null && !conv.staging && c.installProgress == null,
+                    ) { Text(why ?: "开始转换", fontWeight = FontWeight.SemiBold) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FinishedDialog(r: Converter.Result) {
+    val close = {
+        if (AudioPreview.playing == r.file) AudioPreview.stop()
+        Converter.finished = null
+    }
+    AlertDialog(
+        onDismissRequest = close,
+        title = { Text("转换完成") },
+        text = { ResultRow(r, showDelete = false) },
+        confirmButton = { TextButton(onClick = close) { Text("关闭") } },
+    )
 }
 
 @Composable

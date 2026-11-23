@@ -19,8 +19,9 @@ object RvcController {
     private const val TAG = "RvcController"
     private lateinit var app: Context
     private val worker = Executors.newSingleThreadExecutor()
-    private var handle = 0L
-    private var loadedKey: String? = null
+    @Volatile private var handle = 0L
+    /** Model + config the realtime engine has loaded; null after a file conversion unloaded it. */
+    @Volatile private var loadedKey: String? = null
     private var shellActive = false
 
     var settings by mutableStateOf(Settings())
@@ -32,6 +33,9 @@ object RvcController {
     var installProgress by mutableStateOf<Float?>(null)
         private set
     var running by mutableStateOf(false)
+        private set
+    /** The mode the running conversion was started in (the tabs may show the other one). */
+    var runningMode by mutableStateOf(AudioMode.LOCAL)
         private set
     var busy by mutableStateOf<String?>(null)
         private set
@@ -57,6 +61,28 @@ object RvcController {
         device = runCatching { JSONObject(Native.deviceInfo()) }.getOrNull()
         models = store.list()
         worker.execute { installAssets() }
+        Converter.init(app)
+    }
+
+    /** For [Converter], which runs the same native handle on its own thread. */
+    internal fun nativeHandle() = handle
+
+    /** A file conversion freed the realtime models: load them again on the next start. */
+    internal fun realtimeModelsUnloaded() {
+        loadedKey = null
+    }
+
+    /** The tabs at the top: the realtime ones also pick the audio mode (used from the next start). */
+    fun selectTab(tab: AppTab) {
+        val was = settings.tab
+        update {
+            when (tab) {
+                AppTab.LOCAL -> it.copy(tab = tab, mode = AudioMode.LOCAL)
+                AppTab.VIRTUAL_MIC -> it.copy(tab = tab, mode = AudioMode.VIRTUAL_MIC)
+                AppTab.CONVERT -> it.copy(tab = tab)
+            }
+        }
+        if (was == AppTab.CONVERT && tab != AppTab.CONVERT) Converter.release()
     }
 
     private fun installAssets() {
@@ -107,7 +133,10 @@ object RvcController {
     }
 
     // ------------------------------------------------------------------ files opened/shared from other apps
-    /** .pth / .index received via "open with" or "share" (QQ, WeChat, file managers), staged in cache. */
+    /**
+     * .pth / .index received via "open with" or "share" (QQ, WeChat, file managers), staged in
+     * cache; an audio (or video) file goes to the file-conversion screen instead.
+     */
     data class SharedFiles(val pth: java.io.File?, val index: java.io.File?)
 
     var shared by mutableStateOf<SharedFiles?>(null)
@@ -122,6 +151,8 @@ object RvcController {
             val dir = incomingDir.apply { deleteRecursively(); mkdirs() }
             var pth: java.io.File? = null
             var idx: java.io.File? = null
+            var audio: Pair<java.io.File, String>? = null
+            var why: String? = null
             val rejected = mutableListOf<String>()
             for (u in uris) {
                 val name = runCatching { store.displayName(u) }.getOrDefault("file").substringAfterLast('/').ifBlank { "file" }
@@ -132,16 +163,26 @@ object RvcController {
                     ModelStore.Kind.PTH -> pth = f
                     ModelStore.Kind.INDEX -> idx = f
                     ModelStore.Kind.OTHER -> {
-                        rejected += name
-                        f.delete()
+                        val cannot = if (audio == null) Converter.probe(f) else "一次只转换一个音频"
+                        if (cannot == null) audio = f to name
+                        else {
+                            why = why ?: cannot
+                            rejected += name
+                            f.delete()
+                        }
                     }
                 }
             }
-            if (pth == null && idx == null) {
-                message = "不是 RVC 模型文件：${rejected.joinToString()}\n请分享 RVC 导出的 .pth 模型或 added_*.index 索引。"
-            } else {
-                shared = SharedFiles(pth, idx)
-                if (rejected.isNotEmpty()) message = "已忽略非模型文件：${rejected.joinToString()}"
+            audio?.let { (f, name) ->
+                Converter.adopt(f, name)
+                if (settings.tab != AppTab.CONVERT) selectTab(AppTab.CONVERT)
+            }
+            if (pth != null || idx != null) shared = SharedFiles(pth, idx)
+            when {
+                pth == null && idx == null && audio == null -> message =
+                    if (rejected.size == 1 && why != null) "${rejected[0]}：$why"
+                    else "无法使用：${rejected.joinToString()}\n可以打开音频 / 视频文件来变声，或导入 RVC 导出的 .pth 模型和 added_*.index 索引。"
+                rejected.isNotEmpty() -> message = "已忽略：${rejected.joinToString()}" + (why?.let { "\n$it" } ?: "")
             }
         } catch (t: Throwable) {
             Log.e(TAG, "receiveShared", t)
@@ -241,6 +282,7 @@ object RvcController {
     }
 
     private fun startBlocking(): String? {
+        if (Converter.converting) return "正在转换文件，请等它完成或取消"
         stopBlocking()
         ensureLoaded()?.let { return it }
         val s = settings
@@ -299,6 +341,7 @@ object RvcController {
             stopBlocking()
             return r.getString("error")
         }
+        runningMode = s.mode
         running = true
         return null
     }
@@ -347,15 +390,16 @@ object RvcController {
     }
 
     fun pollStatus() {
-        if (handle == 0L) return
+        // a file conversion swaps the engine's models: nothing to report meanwhile
+        if (handle == 0L || Converter.converting) return
         val j = runCatching { JSONObject(Native.status(handle)) }.getOrNull() ?: return
         if (shellActive) runCatching { ShizukuBridge.service?.status() }.getOrNull()?.let { j.put("shell", JSONObject(it)) }
         status = j
     }
 
     fun bench() = worker.execute {
-        if (running) {
-            message = "请先停止实时变声"
+        if (running || Converter.converting) {
+            message = if (running) "请先停止实时变声" else "正在转换文件，请等它完成或取消"
             return@execute
         }
         ensureLoaded()?.let {

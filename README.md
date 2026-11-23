@@ -1,13 +1,14 @@
 # Mobile RVC：Android 实时变声（FCPE）
 
-在 Android 手机上运行 [RVC](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) 的实时变声。功能对应原版 `realtime_gui.py`，音高算法固定为 FCPE：
+在 Android 手机上运行 [RVC](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) 的实时变声和音频文件变声。实时部分对应原版 `realtime_gui.py`，文件转换对应 WebUI 的「模型推理」（`infer/vc/pipeline.py`），音高算法固定为 FCPE：
 
 - **直接导入原版 RVC 模型**：WebUI 导出的 `weights/*.pth`，加上可选的 `added_*.index`。手机上完成转换，不需要电脑。
 - 支持 v1/v2、32k/40k/48k 全部标准结构，以及多说话人模型。
 - 参数和原版界面一致：响应阈值、音调、性别因子（共振峰）、Index Rate、响度因子、采样长度、淡入淡出、额外推理时长、输入降噪、输出降噪、输入监听/输出变声。
-- 两种工作模式
+- 三种工作模式，对应界面最上方的三个标签
   - **本地监听**：麦克风 → 变声 → 耳机（AAudio 低延迟）。
   - **虚拟麦克风（Shizuku）**：拦截其他应用（微信、QQ、Discord、游戏等）的录音，换成变声后的声音。
+  - **文件转换**：把歌曲、录音或视频里的声音整段变声，导出 WAV 或 M4A。可以在 App 里选文件，也可以在其他应用里对音频选「用其他应用打开 / 分享」→「用 rvc手机版 变声」。
 - 计算后端：CPU（自研 NEON fp16 声码器 + ONNX Runtime）、GPU（ORT WebGPU/Vulkan）、NPU（骁龙 HTP / QNN，`qnn` 变体）、NNAPI。
 
 ## 工作原理
@@ -40,6 +41,22 @@ C++ 引擎（`android/app/src/main/cpp/engine/rvc_engine.cpp`）逐行移植自 
 | 实时驱动 | AAudio 独占低延迟流，配合无锁环形缓冲。积压超过上限时丢弃以控制延迟。 |
 | 降噪 | TorchGate 移植到 C++，非 2 的幂长度的 FFT 用 Bluestein 算法。 |
 | 音频流自恢复 | 切换应用、插拔耳机、系统音频服务重启都会让音频流失效，而且待命中（已停止）的流失效时系统不会通知。所以：启动采集流时检查结果，起不来就换一条新的；运行中 0.5 秒收不到麦克风数据就重建采集流，监听输出同理；注入轨道被系统重建后会停在"等待填满"状态，检测到播放位置不动就重新填满；Shizuku 端服务进程被清理时自动重新启动。状态栏会直接提示"没有收到麦克风数据""采集到的是纯静音""对方应用的录音被系统静音"。 |
+
+### 文件转换原理
+
+逐步移植自 WebUI「模型推理」的 `vc_single` 和 `Pipeline.pipeline`（`android/app/src/main/cpp/engine/offline.cpp`）：
+
+```
+文件 ─► 系统解码器（MediaExtractor / MediaCodec）─► 单声道 16k ─► 峰值限制到 0.95 ─► 48 Hz 高通（filtfilt）
+  ─► 在每 x_center 秒附近找最安静的 10 ms 作切点 ─► 两端各反射填充 x_pad 秒 ─► 整段 FCPE（未发声帧插值、变调）
+  ─► 逐段：HuBERT ─► 索引检索 ─► 保护清辅音 ─► enc_p / flow⁻¹ / NSF-HiFiGAN ─► 去掉两端填充 ─► 拼接
+  ─► 音量包络融合（半秒 RMS）─► 超过 0.99 时整体缩小 ─► WAV（模型采样率）或 M4A（AAC）
+```
+
+- 参数和默认值与 WebUI 相同：变调、检索特征占比 0.75、音量包络融合 0.25、保护清辅音 0.33。
+- 和 PC 的差别只在内存：分段更短（`x_pad/x_query/x_center/x_max` = 1/4/12/14 秒，PC 的 CPU 配置是 1/6/38/41；RVC 本身也按显存大小选这组值）；声码器分成 256 帧一块、两侧各多算 24 帧（感受野约 12 帧），结果与整段解码逐位相同；5 分钟以上的文件 FCPE 分成 2 分钟一块。
+- 文件转换使用 ORT CPU（任意长度）和原生 NEON 声码器；用的是「延迟与性能」里的 CPU 线程数和 FP16 设置。转换时实时引擎的模型会被释放，下次开始实时变声时自动重新加载。
+- 转换在前台服务里进行，可以锁屏或切到别的应用，通知栏显示进度并可取消。结果保存在 App 内，可以试听、分享给其他应用，或保存到「音乐/RVC」。
 
 ### 虚拟麦克风原理（Shizuku）
 
@@ -77,6 +94,11 @@ C++ 引擎（`android/app/src/main/cpp/engine/rvc_engine.cpp`）逐行移植自 
 | C++ TorchGate vs PyTorch（48k / 44.1k） | SNR 133 dB |
 | 原生声码器 fp32 / fp16 vs ORT fp32 | 117 dB / 54.6 dB |
 | 虚拟麦克风注入（Android 16 模拟器，uid 2000） | 用 MIC 源录音的应用收到 440 Hz 注入信号，真实麦克风同时正常采集 |
+| 文件转换 vs RVC 原版 `Pipeline.pipeline`（11 秒，单段，变调 4 + 索引 0.75 + 包络 0.25 + 保护 0.33，原生 fp32 声码器） | SNR 69.2 dB，长度相同 |
+| 同上，默认的 fp16 声码器 | SNR 53.8 dB |
+| 同上，68 秒、6 段（切点与原版一致） | SNR 52.2 dB，长度相同 |
+| 文件转换：声码器分块 vs 整段解码 | 逐位相同 |
+| 流式重采样 vs 整段重采样（44.1k / 22.05k / 8k / 96k 等 → 48k / 16k） | 逐位相同 |
 
 ## 性能（实测）
 
@@ -92,6 +114,7 @@ C++ 引擎（`android/app/src/main/cpp/engine/rvc_engine.cpp`）逐行移植自 
 | HuBERT + 声码器都用 WebGPU（主机 GPU 经模拟器转译） | 41 ms | 0.135 |
 
 - App 内实时运行（本地模式和管道模式）：0 块超时、0 欠载。
+- 文件转换（同一模拟器）：11 秒的歌约 3 秒；5 分钟的 mp3 → m4a 约 90 秒（处理时间 / 音频时长 0.30），进程内存峰值约 1.0 GB（实时模式约 0.64 GB）。
 - 手机能否实时，取决于大核的 NEON fp16 算力或 GPU/NPU。2024–2026 年的旗舰平台（骁龙 8 Gen 3 / 8 Elite / 8 Elite Gen 5、天玑 9300 / 9400 / 9500 等）按算力估计，默认 CPU 配置应该能实时，但这只是估计。
 - 不够快时可以：
   - 在 App 里点“性能测试”看实际耗时；
@@ -131,7 +154,8 @@ cd ../android && ./gradlew :app:assembleStandardRelease
 
 `rvc_cli` 用同一份引擎代码，可以在电脑或 `adb shell` 上运行：
 
-- `import` / `process`：导入模型、离线处理 wav；
+- `import` / `process`：导入模型、用实时引擎逐块处理 wav；
+- `convert`：App 的文件转换（任意音视频 → wav / m4a，参数如 `pitch=4 index_rate=0.75 deterministic=true`）；`probe`：查看文件的音轨；`restest`：流式重采样自检；
 - `bench`：基准测试；
 - `pipetest`：管道模式实时测试；
 - `dectest` / `hubtest`：对比加速器后端的精度与速度；
@@ -149,20 +173,21 @@ adb shell 'CLASSPATH=$(pm path com.mobilervc | cut -d: -f2) app_process /system/
 
 1. 导入模型，两种方式：
    - 在 App 里点“导入 .pth”，选择 RVC 导出的推理模型，再选一个 `added_*.index`（可选）。
-   - 在 QQ、微信或文件管理器里，对 `.pth` / `.index` 选“用其他应用打开”或“分享”，再选“导入到 RVC 实时变声”。`.pth` 和 `.index` 可以一起分享。只收到 `.index` 时，App 会让你选择把它添加到哪个已有模型。
+   - 在 QQ、微信或文件管理器里，对 `.pth` / `.index` 选“用其他应用打开”或“分享”，再选“导入到 rvc手机版”。`.pth` 和 `.index` 可以一起分享。只收到 `.index` 时，App 会让你选择把它添加到哪个已有模型。
 2. 调整参数。常规设置可以实时调；性能设置要停止后重新开始才生效。
-3. 选择模式：
+3. 在最上方的标签里选择模式（选中的标签是实心的；正在运行的模式前有圆点，文件转换时显示百分比）：
    - **本地监听**：戴上耳机后点“开始音频转换”。
    - **虚拟麦克风**：先安装并启动 Shizuku，在 App 里授权，再点“开始音频转换”。之后 App 处于待命状态，微信、QQ 等应用一开始录音就会自动变声（开头约 0.5 秒没有人声，只有底噪）。如果对方应用一录音就自己停掉，把"防静音底噪"的电平调大一些再试。
-4. 开始 / 停止按钮和运行状态固定在屏幕底部，加载的进度固定在顶部，设置滚到哪里都看得到。底部状态一行显示估计延迟、推理时间和实时率，点一下展开各阶段耗时、超时块数。
+   - **文件转换**：点“选择音频文件”，或在其他应用里对音频选「用其他应用打开 / 分享」→「用 rvc手机版 变声」（会自动切到这个标签并载入文件）；调好变调等参数后点底部的“开始转换”。完成后可以播放、分享、保存到「音乐/RVC」。实时变声运行时不能转换文件，底部会给出“停止实时变声”按钮。
+4. 开始 / 停止按钮和运行状态固定在屏幕底部，标签和加载进度固定在顶部，设置滚到哪里都看得到。底部状态一行显示估计延迟、推理时间和实时率，点一下展开各阶段耗时、超时块数。
 5. 各组设置点标题可以折叠，折叠后标题右侧显示当前值的摘要；折叠状态会记住。
 
 ## 目录结构
 
 ```
 android/                 Android 工程（Kotlin + C++）
-  app/src/main/cpp/engine/   平台无关的 C++ 引擎：pth/faiss 解析、DSP、ORT、原生声码器、降噪
-  app/src/main/cpp/android/  AAudio 实时驱动、JNI
+  app/src/main/cpp/engine/   平台无关的 C++ 引擎：pth/faiss 解析、DSP、ORT、原生声码器、降噪、文件转换（offline.cpp）
+  app/src/main/cpp/android/  AAudio 实时驱动、JNI、音视频解码 / 编码（offline_file.cpp）
   app/src/main/java/...      Compose 界面、前台服务、Shizuku 桥接、shell 端音频服务
 tools/                   模型导出和桌面参考实现（Python）
   rvc_mobile/rt_pipeline.py  引擎的可执行规格（numpy + ORT），C++ 按它移植
@@ -178,6 +203,11 @@ build/                   生成物（已忽略）
 - QNN / NNAPI / WebGPU 没有系统地在真机上验证过，不同芯片的 NPU 支持的算子不一样。加速器初始化失败时自动退回 CPU（声码器退回原生 NEON），界面会给出原因，可以点"复制"把完整信息发出来。
 - 模型导入时会把当时的计算图复制到模型目录。应用更新带来新图时，只要权重布局没变，加载时会自动换成新图，不需要重新导入。
 - ORT 的 fp16 计算图在 WebGPU 上精度不足，所以所有加速器都用 fp32 图，由 EP 自己选择精度。
+- 文件转换：
+  - 微信 / QQ 的语音消息是 SILK 编码，系统解码器不支持，需要先转成 mp3 / m4a / wav（App 会识别并提示）。能解码哪些格式取决于手机系统（一般包括 mp3、aac/m4a、flac、ogg/opus、wav、amr 和常见视频的音轨）。
+  - 输出单声道，和 RVC 相同。只有 RVC「模型推理」里的参数；性别因子、响应阈值、降噪是实时模式的功能，不用于文件转换。
+  - 只用 CPU：加速器要求固定的张量形状，而每段长度都不同。
+  - 输出 m4a 时，40 kHz 的模型会重采样到 48 kHz（AAC 没有 40 kHz）。
 
 ## 许可
 

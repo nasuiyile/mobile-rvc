@@ -25,6 +25,7 @@ struct BackendConfig {
   bool spinning = true;       // ORT intra-op spin-wait (lower latency, more power)
   std::vector<int> affinity;  // optional logical CPU ids for intra-op threads
   std::string cache_dir;      // QNN context binaries / compiled-graph cache
+  bool mem_arena = true;      // false: CPU memory returned after each run (input sizes vary)
 };
 
 Ort::Env& ort_env();

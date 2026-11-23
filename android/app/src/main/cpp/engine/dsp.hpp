@@ -13,6 +13,8 @@ class SincResampler {
   SincResampler() = default;
   SincResampler(int orig, int target);
   bool identity() const { return o_ == n_; }
+  // Taps reaching beyond an output's input position on either side (plus orig/gcd on the right).
+  int width() const { return width_; }
   int out_len(int in_len) const;
   // y must have out_len(n) elements.
   void process(const float* x, int n, float* y) const;

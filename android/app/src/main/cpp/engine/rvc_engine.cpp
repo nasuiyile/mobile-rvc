@@ -141,7 +141,7 @@ static bool is_static_backend(Backend b) { return b != Backend::CPU && b != Back
 // its weights.bin is laid out as the template's manifest says. When an app update ships
 // corrected graphs for the same layout (same manifest), the imported model takes them over:
 // nothing has to be imported again.
-static void refresh_graphs(const std::string& assets, const std::string& model_dir, const Json& meta) {
+void refresh_model_graphs(const std::string& assets, const std::string& model_dir, const Json& meta) {
   try {
     const std::string tdir = join_path(join_path(assets, "synth"), meta.str_or("template", ""));
     const std::string tman = join_path(tdir, "manifest.json"), mman = join_path(model_dir, "manifest.json");
@@ -165,6 +165,18 @@ static void refresh_graphs(const std::string& assets, const std::string& model_d
 }
 
 
+void RvcEngine::unload() {
+  loaded_ = false;
+  hubert_.reset();
+  fcpe_.reset();
+  enc_.reset();
+  flow_.reset();
+  dec_.clear();
+  native_dec_.reset();
+  index_.reset();
+  worker_.reset();
+}
+
 void RvcEngine::load(const std::string& model_dir, const EngineConfig& cfg) {
   loaded_ = false;
   hubert_.reset();
@@ -178,7 +190,7 @@ void RvcEngine::load(const std::string& model_dir, const EngineConfig& cfg) {
   model_dir_ = model_dir;
   dec_warning_.clear();
   meta_ = Json::parse(read_file(join_path(model_dir, "model.json")));
-  refresh_graphs(assets_, model_dir, meta_);
+  refresh_model_graphs(assets_, model_dir, meta_);
   weights_salt_ = file_fingerprint(join_path(model_dir, "weights.bin"));
   tgt_sr_ = meta_["tgt_sr"].i32();
   upp_ = meta_["upp"].i32();

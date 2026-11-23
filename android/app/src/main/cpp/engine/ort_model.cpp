@@ -251,6 +251,7 @@ void OnnxModel::create(const std::string& path, const BackendConfig& cfg,
   so.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
   so.SetInterOpNumThreads(1);
   so.SetIntraOpNumThreads(std::max(1, cfg.threads));
+  if (!cfg.mem_arena) so.DisableCpuMemArena();
   so.AddConfigEntry("session.intra_op.allow_spinning", cfg.spinning ? "1" : "0");
   if (!cfg.affinity.empty() && cfg.threads > 1 && cfg.backend != Backend::XNNPACK) {
     // thread 0 is the caller; every pool thread may run on any of the chosen (big) cores

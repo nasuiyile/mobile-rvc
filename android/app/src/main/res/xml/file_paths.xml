@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Converter results (filesDir/convert/out) -->
+    <files-path name="converted" path="convert/out/" />
+</paths>
