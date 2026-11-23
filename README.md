@@ -11,6 +11,19 @@
   - **文件转换**：把歌曲、录音或视频里的声音整段变声，导出 WAV 或 M4A。可以在 App 里选文件，也可以在其他应用里对音频选「用其他应用打开 / 分享」→「用 rvc手机版 变声」。
 - 计算后端：CPU（自研 NEON fp16 声码器 + ONNX Runtime）、GPU（ORT WebGPU/Vulkan）、NPU（骁龙 HTP / QNN，`qnn` 变体）、NNAPI。
 
+## 截图
+
+<table>
+  <tr>
+    <td align="center"><img src="docs/screenshots/local.png" width="200" alt="本地监听"><br>本地监听（运行中）</td>
+    <td align="center"><img src="docs/screenshots/virtual_mic.png" width="200" alt="虚拟麦克风"><br>虚拟麦克风</td>
+    <td align="center"><img src="docs/screenshots/convert.png" width="200" alt="文件转换"><br>文件转换（转换中）</td>
+    <td align="center"><img src="docs/screenshots/convert_done.png" width="200" alt="转换完成"><br>转换完成</td>
+  </tr>
+</table>
+
+最上方三个标签切换模式：选中的标签是实心的，正在运行的模式前有圆点，文件转换时显示进度百分比。开始 / 停止和运行状态固定在底部。
+
 ## 工作原理
 
 ```
