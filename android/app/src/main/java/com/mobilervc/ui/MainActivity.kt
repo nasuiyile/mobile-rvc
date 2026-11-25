@@ -209,6 +209,7 @@ private fun Screen() {
         }
     }
     var showImport by remember { mutableStateOf(false) }
+    var showLibrary by remember { mutableStateOf(false) }
     val basePack = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { u -> c.importBasePack { ctx.contentResolver.openInputStream(u)!! } }
     }
@@ -260,10 +261,11 @@ private fun Screen() {
         }
     }
 
-    if (showImport) ImportDialog(onDismiss = { showImport = false }) { pth, idx ->
+    if (showImport) ImportDialog(onDismiss = { showImport = false }, onLibrary = { showImport = false; showLibrary = true }) { pth, idx ->
         showImport = false
         c.importModel(pth, idx)
     }
+    if (showLibrary) ModelLibraryDialog(onDismiss = { showLibrary = false })
     c.shared?.let { sh -> SharedFilesDialog(sh) }
     Converter.finished?.let { r -> FinishedDialog(r) }
     c.message?.let { msg -> MessageDialog(msg) { c.message = null } }
@@ -315,8 +317,11 @@ private fun TopBar() {
             if (busy != null) shown = busy
             AnimatedVisibility(busy != null) {
                 Column {
-                    Text(shown, Modifier.padding(start = 16.dp, end = 16.dp, bottom = 6.dp), style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(shown, Modifier.weight(1f).padding(start = 16.dp, end = 16.dp, bottom = 6.dp), style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        if (c.downloading) TextButton(onClick = { c.cancelDownload() }) { Text("取消") }
+                    }
                     if (install != null) LinearProgressIndicator(progress = { install }, modifier = Modifier.fillMaxWidth().height(3.dp))
                     else LinearProgressIndicator(Modifier.fillMaxWidth().height(3.dp))
                 }
@@ -809,6 +814,7 @@ private fun ImportDialog(
     initialIndex: Uri? = null,
     title: String = "导入 RVC 模型",
     onDismiss: () -> Unit,
+    onLibrary: (() -> Unit)? = null,
     onImport: (Uri, Uri?) -> Unit,
 ) {
     var pth by remember { mutableStateOf(initialPth) }
@@ -824,6 +830,11 @@ private fun ImportDialog(
                 Text("直接使用 RVC WebUI 导出的推理模型（weights/*.pth）和 added_*.index，无需转换。")
                 OutlinedButton(onClick = { pickPth.launch(arrayOf("*/*")) }) { Text(pth?.let { store.displayName(it) } ?: "选择 .pth 文件") }
                 OutlinedButton(onClick = { pickIdx.launch(arrayOf("*/*")) }) { Text(idx?.let { store.displayName(it) } ?: "选择 .index 文件（可选）") }
+                if (onLibrary != null) {
+                    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                    Text("没有模型文件？从在线模型库挑选，点一下就能下载导入。", style = MaterialTheme.typography.bodySmall)
+                    FilledTonalButton(onClick = onLibrary) { Text("打开在线模型库") }
+                }
             }
         },
         confirmButton = { TextButton(onClick = { pth?.let { onImport(it, idx) } }, enabled = pth != null) { Text("导入") } },

@@ -62,9 +62,9 @@ class ModelStore(private val ctx: Context) {
     }
 
     /** Imports an original RVC .pth (+ optional .index). Throws with the native error message. */
-    fun import(pth: Uri, index: Uri?): VoiceModel {
+    fun import(pth: Uri, index: Uri?, title: String? = null): VoiceModel {
         val assets = AssetInstaller.baseDir(ctx).absolutePath
-        val base = displayName(pth).removeSuffix(".pth")
+        val base = title?.takeIf { it.isNotBlank() } ?: displayName(pth).removeSuffix(".pth")
         // the same file shared twice should still be distinguishable in the model list
         val taken = list().map { it.name }.toSet()
         val name = if (base !in taken) base else (2..999).map { "$base ($it)" }.first { it !in taken }

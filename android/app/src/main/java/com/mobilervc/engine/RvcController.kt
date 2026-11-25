@@ -213,6 +213,67 @@ object RvcController {
         }
     }
 
+    // ------------------------------------------------------------------ online model library
+    /** A download is running (the top bar offers to cancel it). */
+    var downloading by mutableStateOf(false)
+        private set
+    @Volatile private var cancelDownload = false
+
+    fun cancelDownload() {
+        cancelDownload = true
+    }
+
+    /**
+     * Downloads a model picked in the online library and imports it as [title]: a .pth with its
+     * optional index, or a .zip holding both ([pthUrl] then points at the zip).
+     */
+    fun downloadModel(title: String, pthUrl: String, indexUrl: String?) = worker.execute {
+        busy = "连接中…"
+        downloading = true
+        cancelDownload = false
+        try {
+            val dir = incomingDir.apply { deleteRecursively(); mkdirs() }
+            fun fetch(url: String) = ModelDownloader.download(url, dir, null, { name, done, total ->
+                busy = if (total > 0) "下载 %s  %.1f / %.1f MB（%d%%）".format(name, done / 1048576.0, total / 1048576.0, done * 100 / total)
+                else "下载 %s  %.1f MB".format(name, done / 1048576.0)
+            }) { cancelDownload }
+            var pth = fetch(pthUrl)
+            var idx = indexUrl?.let { fetch(it) }
+            if (ModelDownloader.isModelArchive(pth)) {
+                busy = "解压 ${pth.name}…"
+                val (p, i) = ModelDownloader.extract(pth, dir) { cancelDownload }
+                pth.delete()
+                pth = p ?: throw IllegalArgumentException("压缩包里没有 .pth 模型")
+                if (idx == null) idx = i
+            }
+            downloading = false
+            busy = "导入模型…"
+            val m = store.import(android.net.Uri.fromFile(pth), null, title)
+            // a mismatched index (model sites have v2 indexes next to v1 models) shouldn't cost the model
+            val idxError = idx?.let { f ->
+                busy = "转换索引…"
+                runCatching { store.attachIndex(m, android.net.Uri.fromFile(f)) }.exceptionOrNull()
+            }
+            models = store.list()
+            val done = models.firstOrNull { it.id == m.id } ?: m
+            update { it.copy(modelId = done.id) }
+            message = "已下载并导入 ${done.name} (${done.version}, ${done.sampleRate / 1000}k${if (done.hasIndex) ", 含索引" else ""})" +
+                (idxError?.let { "\n索引未能使用：${it.message}" } ?: "")
+        } catch (t: Throwable) {
+            Log.e(TAG, "downloadModel", t)
+            message = when (t) {
+                is ModelDownloader.Cancelled -> "下载已取消"
+                is java.net.UnknownHostException, is java.net.ConnectException -> "下载失败：无法连接服务器，请检查网络"
+                is java.net.SocketTimeoutException -> "下载失败：连接超时，请稍后重试"
+                else -> "下载失败: ${t.message}"
+            }
+        } finally {
+            downloading = false
+            busy = null
+            incomingDir.deleteRecursively()
+        }
+    }
+
     fun attachIndex(model: VoiceModel, index: android.net.Uri) = worker.execute {
         busy = "转换索引…"
         try {
