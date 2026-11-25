@@ -224,4 +224,4 @@ build/                   生成物（已忽略）
 
 ## 许可
 
-本项目代码参考并移植自以下 MIT 许可项目：RVC-Project/Retrieval-based-Voice-Conversion-WebUI、CNChTu/FCPE（torchfcpe）、TorchGate。依赖：ONNX Runtime（MIT）、Shizuku API（Apache-2.0）、HiddenApiBypass（Apache-2.0）。
+本项目以 [MIT 许可](LICENSE) 发布。代码参考并移植自 RVC-Project/Retrieval-based-Voice-Conversion-WebUI、CNChTu/FCPE（torchfcpe）、TorchGate（均为 MIT）；依赖 ONNX Runtime（MIT）、Shizuku API（Apache-2.0）、HiddenApiBypass（Apache-2.0）。上游版权声明与许可全文见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
