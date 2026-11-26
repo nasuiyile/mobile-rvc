@@ -113,8 +113,11 @@ import com.mobilervc.engine.Backend
 import com.mobilervc.engine.Converter
 import com.mobilervc.engine.RvcController
 import com.mobilervc.service.VoiceService
+import com.mobilervc.shizuku.RootBridge
+import com.mobilervc.shizuku.ShellBridge
 import com.mobilervc.shizuku.ShizukuBridge
 import kotlinx.coroutines.delay
+import kotlin.concurrent.thread
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
@@ -122,7 +125,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         RvcController.init(this)
-        ShizukuBridge.init()
+        ShellBridge.init()
         setContent { AppTheme { Screen() } }
         if (savedInstanceState == null) handleShare(intent)
     }
@@ -150,7 +153,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        ShizukuBridge.refresh()
+        ShellBridge.refresh()
         RvcController.refreshModels()
     }
 
@@ -561,14 +564,35 @@ private fun LocalAudioSection() {
 private fun VirtualMicSection() {
     val c = RvcController
     val s = c.settings
-    Section("vmic", "虚拟麦克风", summary = ShizukuBridge.stateText + if (s.monitor) " · 本地监听" else "") {
+    val ctx = LocalContext.current
+    val cs = MaterialTheme.colorScheme
+    // rooted devices need no Shizuku: the service then runs as root through su
+    val root = RootBridge.available
+    val shizukuOk = ShellBridge.shizukuUsable
+    Section("vmic", "虚拟麦克风", summary = ShellBridge.stateText + if (s.monitor) " · 本地监听" else "") {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.heightIn(min = 32.dp)) {
             Label("Shizuku")
-            Text(ShizukuBridge.stateText, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium,
-                color = if (ShizukuBridge.state == ShizukuBridge.State.NOT_RUNNING || ShizukuBridge.state == ShizukuBridge.State.NO_PERMISSION)
-                    MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
-            if (ShizukuBridge.state == ShizukuBridge.State.NO_PERMISSION) SmallButton("授权", filled = true) { ShizukuBridge.requestPermission() }
+            Text(ShellBridge.shizukuText + if (root && !shizukuOk) " · 有 Root 时不需要" else "", Modifier.weight(1f),
+                style = MaterialTheme.typography.bodyMedium,
+                color = when {
+                    shizukuOk -> cs.onSurface
+                    root -> cs.onSurfaceVariant
+                    else -> cs.error
+                })
+            if (ShizukuBridge.state == ShizukuBridge.State.NO_PERMISSION) SmallButton("授权", filled = !root) { ShizukuBridge.requestPermission() }
         }
+        if (root) Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.heightIn(min = 32.dp)) {
+            Label("Root")
+            val st = RootBridge.state
+            Text(if (st == RootBridge.State.AVAILABLE && shizukuOk) "可用（优先使用 Shizuku）" else RootBridge.stateText, Modifier.weight(1f),
+                style = MaterialTheme.typography.bodyMedium, color = if (st == RootBridge.State.DENIED) cs.error else cs.onSurface)
+            if (!shizukuOk && (st == RootBridge.State.AVAILABLE || st == RootBridge.State.DENIED)) {
+                SmallButton(if (st == RootBridge.State.DENIED) "重试" else "授权", filled = true, enabled = !c.running) {
+                    thread(name = "rvc-root") { ShellBridge.connectRoot(ctx) }
+                }
+            }
+        }
+        if (root && RootBridge.state == RootBridge.State.DENIED) RootBridge.error?.let { Caption("Root 启动失败：$it") }
         SwitchRow("同时本地监听", "自己也能听到变声", s.monitor) { v -> c.update { it.copy(monitor = v) } }
         SwitchRow("防静音底噪", "没说话时不给对方纯静音，避免录音被判为无声而中断", s.comfortNoise) { v -> c.update { it.copy(comfortNoise = v) } }
         if (s.comfortNoise) {
@@ -578,7 +602,8 @@ private fun VirtualMicSection() {
             "微信、QQ 等应用录音时会自动收到变声后的声音；平时不占用麦克风。每次录音开头约 0.4–0.6 秒没有人声（不会漏出本音），采样长度越小这段越短。\n" +
                 "开了降噪或响应阈值时，不说话的那段输出是纯静音，有些应用会据此认定麦克风异常并立刻结束录音；" +
                 "防静音底噪会在整段录音里垫上一层和安静房间差不多的底噪（默认 −60 dB，仍被中断就调大），重新开始后生效。\n" +
-                "首次使用会通过 Shizuku 开启「RVC 虚拟麦克风」无障碍服务，只用来让变声采集和语音消息同时进行，不读取屏幕内容。")
+                "需要 Shizuku 或 Root 二选一。已 root 的手机不用装 Shizuku：开始时会请求 Root 授权（KernelSU / APatch 要先在管理器里给本应用授予 Root）；Shizuku 已授权时优先用 Shizuku。\n" +
+                "首次使用会通过 Shizuku / Root 开启「RVC 虚拟麦克风」无障碍服务，只用来让变声采集和语音消息同时进行，不读取屏幕内容。")
         ParamSlider("输出增益", s.outputGain, 0f..3f, 29, "%.1f×".format(s.outputGain)) { v -> c.update { it.copy(outputGain = v) } }
         Segmented(listOf("输出变声", "输入监听"), if (s.passthrough) 1 else 0) { i -> c.update { it.copy(passthrough = i == 1) } }
     }

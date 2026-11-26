@@ -8,7 +8,7 @@
 - 参数和原版界面一致：响应阈值、音调、性别因子（共振峰）、Index Rate、响度因子、采样长度、淡入淡出、额外推理时长、输入降噪、输出降噪、输入监听/输出变声。
 - 三种工作模式，对应界面最上方的三个标签
   - **本地监听**：麦克风 → 变声 → 耳机（AAudio 低延迟）。
-  - **虚拟麦克风（Shizuku）**：拦截其他应用（微信、QQ、Discord、游戏等）的录音，换成变声后的声音。
+  - **虚拟麦克风（Shizuku 或 Root）**：拦截其他应用（微信、QQ、Discord、游戏等）的录音，换成变声后的声音。
   - **文件转换**：把歌曲、录音或视频里的声音整段变声，导出 WAV 或 M4A。可以在 App 里选文件，也可以在其他应用里对音频选「用其他应用打开 / 分享」→「用 rvc手机版 变声」。
 - 计算后端：CPU（自研 NEON fp16 声码器 + ONNX Runtime）、GPU（ORT WebGPU/Vulkan）、NPU（骁龙 HTP / QNN，`qnn` 变体）、NNAPI。
 
@@ -72,9 +72,11 @@ C++ 引擎（`android/app/src/main/cpp/engine/rvc_engine.cpp`）逐行移植自 
 - 文件转换使用 ORT CPU（任意长度）和原生 NEON 声码器；用的是「延迟与性能」里的 CPU 线程数和 FP16 设置。转换时实时引擎的模型会被释放，下次开始实时变声时自动重新加载。
 - 转换在前台服务里进行，可以锁屏或切到别的应用，通知栏显示进度并可取消。结果保存在 App 内，可以试听、分享给其他应用，或保存到「音乐/RVC」。
 
-### 虚拟麦克风原理（Shizuku）
+### 虚拟麦克风原理（Shizuku / Root）
 
 `ShellAudioService` 通过 Shizuku 以 shell 身份（uid 2000）运行，有 `MODIFY_AUDIO_ROUTING`、`CAPTURE_AUDIO_OUTPUT`、`RECORD_AUDIO` 权限。
+
+已 root 的手机不需要 Shizuku：App 通过 `su` 用 `app_process` 以 root 身份（uid 0）启动同一个 `ShellAudioService`（入口 `RootServiceMain`），再用一条只有 root / 系统能发进来的广播（未导出的接收器 + 每次启动随机生成的 token）把它的 binder 交给 App。root 进程的 stdin 连着 App，App 退出时它读到 EOF 就自己退出，和 Shizuku 的非守护服务一样。Shizuku 已运行并授权时优先用 Shizuku，否则用 Root。
 
 1. **注入**：注册 AudioPolicy 回环混音（`MIX_TYPE_RECORDERS` + `ROUTE_FLAG_LOOP_BACK`）。其他应用用 MIC、VOICE_COMMUNICATION、CAMCORDER、VOICE_RECOGNITION、UNPROCESSED 这几个录音源录音时，实际读到的是我们注入的变声音频。
 2. **按需采集**：平时不录音。监测到有应用开始录音后，才开始采集真实麦克风。
@@ -191,7 +193,7 @@ adb shell 'CLASSPATH=$(pm path com.mobilervc | cut -d: -f2) app_process /system/
 2. 调整参数。常规设置可以实时调；性能设置要停止后重新开始才生效。
 3. 在最上方的标签里选择模式（选中的标签是实心的；正在运行的模式前有圆点，文件转换时显示百分比）：
    - **本地监听**：戴上耳机后点“开始音频转换”。
-   - **虚拟麦克风**：先安装并启动 Shizuku，在 App 里授权，再点“开始音频转换”。之后 App 处于待命状态，微信、QQ 等应用一开始录音就会自动变声（开头约 0.5 秒没有人声，只有底噪）。如果对方应用一录音就自己停掉，把"防静音底噪"的电平调大一些再试。
+   - **虚拟麦克风**：已 root 的手机直接点“开始音频转换”，在 Root 管理器的弹窗里允许即可（KernelSU / APatch 不弹窗，要先在管理器里给本应用授予 Root）；没有 root 的先安装并启动 Shizuku，在 App 里授权，再点“开始音频转换”。之后 App 处于待命状态，微信、QQ 等应用一开始录音就会自动变声（开头约 0.5 秒没有人声，只有底噪）。如果对方应用一录音就自己停掉，把"防静音底噪"的电平调大一些再试。
    - **文件转换**：点“选择音频文件”，或在其他应用里对音频选「用其他应用打开 / 分享」→「用 rvc手机版 变声」（会自动切到这个标签并载入文件）；调好变调等参数后点底部的“开始转换”。完成后可以播放、分享、保存到「音乐/RVC」。实时变声运行时不能转换文件，底部会给出“停止实时变声”按钮。
 4. 开始 / 停止按钮和运行状态固定在屏幕底部，标签和加载进度固定在顶部，设置滚到哪里都看得到。底部状态一行显示估计延迟、推理时间和实时率，点一下展开各阶段耗时、超时块数。
 5. 各组设置点标题可以折叠，折叠后标题右侧显示当前值的摘要；折叠状态会记住。
@@ -202,7 +204,7 @@ adb shell 'CLASSPATH=$(pm path com.mobilervc | cut -d: -f2) app_process /system/
 android/                 Android 工程（Kotlin + C++）
   app/src/main/cpp/engine/   平台无关的 C++ 引擎：pth/faiss 解析、DSP、ORT、原生声码器、降噪、文件转换（offline.cpp）
   app/src/main/cpp/android/  AAudio 实时驱动、JNI、音视频解码 / 编码（offline_file.cpp）
-  app/src/main/java/...      Compose 界面、前台服务、Shizuku 桥接、shell 端音频服务
+  app/src/main/java/...      Compose 界面、前台服务、Shizuku / Root 桥接、shell 端音频服务
 tools/                   模型导出和桌面参考实现（Python）
   rvc_mobile/rt_pipeline.py  引擎的可执行规格（numpy + ORT），C++ 按它移植
 build/                   生成物（已忽略）

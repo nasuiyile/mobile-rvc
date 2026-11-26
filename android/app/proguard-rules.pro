@@ -9,3 +9,5 @@
 -dontwarn ai.onnxruntime.**
 -keep class com.mobilervc.shizuku.ShellSelfTest { public static void main(java.lang.String[]); }
 -keep class com.mobilervc.shizuku.MicProbe { public static void main(java.lang.String[]); }
+# Started by RootBridge through su + app_process (root instead of Shizuku)
+-keep class com.mobilervc.shizuku.RootServiceMain { public static void main(java.lang.String[]); }

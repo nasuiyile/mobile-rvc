@@ -6,7 +6,8 @@ import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import com.mobilervc.shizuku.ShizukuBridge
+import com.mobilervc.shizuku.IShellAudio
+import com.mobilervc.shizuku.ShellBridge
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Executors
@@ -22,7 +23,9 @@ object RvcController {
     @Volatile private var handle = 0L
     /** Model + config the realtime engine has loaded; null after a file conversion unloaded it. */
     @Volatile private var loadedKey: String? = null
-    private var shellActive = false
+    /** The privileged service (Shizuku or root) feeding the virtual microphone while it runs. */
+    @Volatile private var activeShell: IShellAudio? = null
+    private val shellActive get() = activeShell != null
 
     var settings by mutableStateOf(Settings())
         private set
@@ -359,7 +362,7 @@ object RvcController {
             opts.put("local_input", true).put("local_output", true)
             r = JSONObject(Native.start(handle, opts.toString(), -1, -1))
         } else {
-            val shell = ShizukuBridge.connect(app) ?: return "无法连接 Shizuku 服务：${ShizukuBridge.stateText}"
+            val shell = ShellBridge.connect(app) ?: return "无法启动虚拟麦克风服务：${ShellBridge.lastError}"
             // voice messages need this app's capture to count as accessibility capture
             val a11y = "${app.packageName}/${com.mobilervc.service.MicAccessibilityService::class.java.name}"
             runCatching { shell.ensureAccessibility(a11y) }
@@ -392,9 +395,9 @@ object RvcController {
             }
             if (sr.has("error")) {
                 Native.stop(handle)
-                return "Shizuku 端启动失败: ${sr.getString("error")}"
+                return "${ShellBridge.name} 端启动失败: ${sr.getString("error")}"
             }
-            shellActive = true
+            activeShell = shell
             captureMode = 0
             watchShell(shell)
         }
@@ -421,17 +424,19 @@ object RvcController {
             val now = android.os.SystemClock.elapsedRealtime()
             if (now - shellRestartedAt < 15_000) {  // dies again right away: do not loop
                 stopBlocking()
-                message = "Shizuku 端服务反复退出，变声已停止。请检查 Shizuku 是否在运行，以及系统是否在清理后台。"
+                message = "${ShellBridge.name} 端服务反复退出，变声已停止。" +
+                    (if (ShellBridge.backend == ShellBridge.Backend.ROOT) "请检查 Root 授权" else "请检查 Shizuku 是否在运行") +
+                    "，以及系统是否在清理后台。"
                 return@execute
             }
             shellRestartedAt = now
             Log.w(TAG, "shell service died, restarting the virtual microphone")
             val err = runCatching { startBlocking() }.getOrElse { it.message ?: it.toString() }
-            if (err != null) message = "Shizuku 端服务已退出，重新启动失败：$err"
+            if (err != null) message = "${ShellBridge.name} 端服务已退出，重新启动失败：$err"
         }
     }
 
-    private fun watchShell(shell: com.mobilervc.shizuku.IShellAudio) {
+    private fun watchShell(shell: IShellAudio) {
         val b = shell.asBinder()
         if (b === watchedShell) return
         runCatching { watchedShell?.unlinkToDeath(shellDeath, 0) }
@@ -441,9 +446,9 @@ object RvcController {
     fun stop() = worker.execute { stopBlocking() }
 
     private fun stopBlocking() {
-        if (shellActive) {
-            runCatching { ShizukuBridge.service?.stop() }
-            shellActive = false
+        activeShell?.let { shell ->
+            runCatching { shell.stop() }
+            activeShell = null
         }
         if (handle != 0L) Native.stop(handle)
         captureMode = 0
@@ -454,7 +459,7 @@ object RvcController {
         // a file conversion swaps the engine's models: nothing to report meanwhile
         if (handle == 0L || Converter.converting) return
         val j = runCatching { JSONObject(Native.status(handle)) }.getOrNull() ?: return
-        if (shellActive) runCatching { ShizukuBridge.service?.status() }.getOrNull()?.let { j.put("shell", JSONObject(it)) }
+        activeShell?.let { shell -> runCatching { shell.status() }.getOrNull()?.let { j.put("shell", JSONObject(it)) } }
         status = j
     }
 
